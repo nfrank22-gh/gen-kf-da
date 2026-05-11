@@ -1,79 +1,61 @@
-using Lux, Reactant, Random, AbstractFFTs
-using JLD2
-using FFTW
 using Gen_DA.NN
+using Gen_DA.NN.DataPipeline
+using Reactant, Random
 
 Reactant.set_default_backend("cuda")
 const dev = reactant_device()
-const L = 2*pi
-
-function prepare_data(Re::Real, NDOF::Int, spatial_ci::AbstractArray{<:CartesianIndex}, n_meas_time::Int, rng, T::Type{<:AbstractFloat})
-  data = load("data/no_particles/Re$(Re)_N$NDOF/trajectory.jld2")
-  trj_vort = T.(data["trajectory"])       # (N, N, n_saves), [y, x, t]
-  t_idx = rand(rng, 1:size(trj_vort, 3), n_meas_time)
-
-  ky_1d = 2π/L .* rfftfreq(NDOF, NDOF)
-  kx_1d = 2π/L .* fftfreq(NDOF, NDOF)
-  ky = T.(reshape(ky_1d, NDOF÷2+1, 1))   # (N÷2+1, 1)
-  kx = T.(reshape(kx_1d, 1, NDOF))        # (1, N)
-
-  trj_vort_hat = rfft(trj_vort, (1, 2))            # (N÷2+1, N, n_saves)
-
-  lap = -(kx.^2 .+ ky.^2)                         # (im*kx)^2 + (im*ky)^2, shape (N÷2+1, N)
-  lap[1, 1] = 1                                    # avoid div-by-zero at DC
-  psi_hat = trj_vort_hat ./ lap                    # stream function: ω = ∇²ψ
-  u = irfft((im .* ky) .* psi_hat, NDOF, (1, 2))  # u = ∂ψ/∂y
-  v = irfft(.-(im .* kx) .* psi_hat, NDOF, (1, 2)) # v = -∂ψ/∂x
-
-  u_t = u[:, :, t_idx]
-  v_t = v[:, :, t_idx]
-  u_meas = u_t[spatial_ci]
-  v_meas = v_t[spatial_ci]
-
-  return u_meas, v_meas
-end
-
-function get_meas_idx(n_meas::Int, n_meas_time::Int, NDOF::Int, rng)
-  x_idx = rand(rng, 1:NDOF, n_meas, n_meas_time)
-  y_idx = rand(rng, 1:NDOF, n_meas, n_meas_time)
-  ci = CartesianIndex.(x_idx, y_idx, (1:n_meas_time)')
-  return ci
-end
 
 function main()
-  T = Float32
-  Re = 100
-  NDOF = 128
-  n_meas_space = 20
-  n_meas_time = 100
+    T            = Float32
+    Re           = 100
+    N            = 128
+    npart        = 40
+    T_train      = 800.0
+    n_meas_space = 20
+    batch_size   = 100
+    n_epochs     = 10
+    num_freq     = 16
+    latent_dim   = 100
+    layers       = [latent_dim, 512, 1024]
+    n_slices     = 50
 
-  rng = Xoshiro(123)
-  spatial_ci = get_meas_idx(n_meas_space, n_meas_time, NDOF, rng)
-  u_meas_trg, v_meas_trg = prepare_data(Re, NDOF, spatial_ci, n_meas_time, rng, T)
+    rng = Xoshiro(123)
 
-  num_freq = 16
-  layers = [100, 512, 1024]
-  x = randn(rng, T, layers[1], n_meas_time)
+    traj = load_trajectory("data/particles/Re$(Re)_N$(N)_npart$(npart)/trajectory.jld2")
+    train_snaps, _ = split_trajectory(traj.trajectory, traj.dt, traj.save_every, T_train)
+    n_train = size(train_snaps, 3)
+    println("Training on $n_train snapshots (T_train=$T_train)")
 
-  model, ps, st = VortFourierDecoder(layers, num_freq, L, rng, T)
-  
-  n_slices = 50
-  thetas = randn(rng, T, n_slices, 2*n_meas_space)
+    sensor_ci  = make_sensor_array(N, n_meas_space, rng)
+    sensor_lin = LinearIndices((N, N))[sensor_ci]
 
-  if false
-    ps = ps |> dev
-    st = st |> dev
-    x = x |> dev
-    thetas = thetas |> dev
-    loss_compiled = @compile loss_fn(model, NDOF, x, ps, st, u_meas_trg, v_meas_trg, spatial_ci, thetas)
-    loss, st = loss_compiled(model, NDOF, x, ps, st, u_meas_trg, v_meas_trg, spatial_ci, thetas)
-  else
-    loss, st = loss_fn(model, NDOF, x, ps, st, u_meas_trg, v_meas_trg, spatial_ci, thetas)
-  end
+    model, ps, st = VortFourierDecoder(layers, num_freq, T(2π), rng, T)
+    ps     = ps |> dev
+    st     = st |> dev
+    thetas = randn(rng, T, n_slices, 2 * n_meas_space) |> dev
 
-  println("loss: ", loss)
+    # Compile once for the fixed batch size; undersized last batch is skipped each epoch
+    x_dummy   = Reactant.to_rarray(zeros(T, latent_dim, batch_size))
+    u_dummy   = Reactant.to_rarray(zeros(T, n_meas_space, batch_size))
+    v_dummy   = Reactant.to_rarray(zeros(T, n_meas_space, batch_size))
+    loss_compiled = @compile loss_fn(model, N, x_dummy, ps, st, u_dummy, v_dummy, sensor_lin, thetas)
+    println("Compiled loss function.")
 
-  return nothing
+    for epoch in 1:n_epochs
+        batches    = batch_partition(n_train, batch_size, rng)
+        epoch_loss = zero(T)
+        n_full     = 0
+        for batch_indices in batches
+            length(batch_indices) == batch_size || continue
+            u_trg, v_trg = extract_observations(train_snaps, batch_indices, sensor_ci, N)
+            x = Reactant.to_rarray(randn(rng, T, latent_dim, batch_size))
+            l, st = loss_compiled(model, N, x, Reactant.to_rarray(u_trg), Reactant.to_rarray(v_trg),
+                                  sensor_lin, thetas)
+            epoch_loss += Array(l)[]
+            n_full += 1
+        end
+        println("epoch $epoch  loss = $(epoch_loss / max(n_full, 1))")
+    end
 end
 
 main()

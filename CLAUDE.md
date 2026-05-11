@@ -1,6 +1,6 @@
 # gen_DA_project
 
-Julia codebase for generating training data for a data assimilation (DA) neural network. Solves 2D Kolmogorov-forced Navier-Stokes on a GPU using a pseudo-spectral method, tracks passive tracer particles, and saves trajectories for downstream model training.
+Julia codebase for generating training data and training a generative model for data assimilation (DA). Solves 2D Kolmogorov-forced Navier-Stokes on a GPU using a pseudo-spectral method, tracks passive tracer particles, and saves trajectories for downstream model training.
 
 ## Running scripts
 
@@ -9,13 +9,14 @@ Always activate the project environment:
 ```
 julia --project=. scripts/gen_data.jl
 julia --project=. scripts/train_ctrl.jl
+julia --project=. test/runtests.jl
 ```
 
 ## Package structure
 
 ```
 src/
-  Gen_DA.jl              # top-level module; includes Solver and Decoder submodules
+  Gen_DA.jl              # top-level module; includes Solver and NN submodules
   Gen_DA/
     Solver.jl            # submodule: NS solver + particle tracking
     Solver/
@@ -24,12 +25,18 @@ src/
       integrate.jl       # integrate() with/without particle tracking; random ICs
       particles.jl       # bilinear_interp_periodic (pure array gather), tracer_substep
       solver_plotting.jl # plot_vorticity, animate_particles (CairoMakie)
-    Decoder.jl           # submodule: neural decoder model
-    Decoder/
-      model.jl           # VortFourierDecoder <: Lux.AbstractLuxLayer (stub)
+    NN.jl                # submodule: generative model + data pipeline
+    NN/
+      model.jl           # VortFourierDecoder <: Lux.AbstractLuxLayer; eval_decoder_vort, eval_decoder_vel
+      loss_fn.jl         # sliced_wasserstein, loss_fn
+      data_pipeline.jl   # DataPipeline submodule: load_trajectory, split_trajectory,
+                         #   make_sensor_array, batch_partition, extract_observations
 scripts/
   gen_data.jl            # spin-up + integrate + save to data/particles/ or data/no_particles/
   train_ctrl.jl          # training stub (WIP)
+test/
+  runtests.jl            # test entry point
+  test_data.jl           # CPU tests for DataPipeline
 ```
 
 ## Data output
@@ -45,7 +52,7 @@ scripts/
 | `N` | 128 | Grid resolution (N×N) |
 | `dt` | 0.01 | Timestep |
 | `T_spinup` | 50.0 | Spin-up time before recording |
-| `T_data` | 50.0 | Integration time to record |
+| `T_data` | 1000 | Integration time to record |
 | `save_every` | 10 | Save snapshot every N steps |
 | `npart` | 40 | Number of passive tracer particles |
 
@@ -66,7 +73,6 @@ The solver uses [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (XLA back
 
 ## Known issues
 
-- **`Decoder` precompilation**: `model.jl` has a constructor that conflicts with the auto-generated one; `Decoder.jl` uses `__precompile__(false)` to suppress the error. The `VortFourierDecoder` constructor is a stub — it computes `kx`/`ky` but does not yet return a struct instance.
 - **Lux API**: `AbstractExplicitLayer` was renamed to `AbstractLuxLayer` in Lux v1.x. `model.jl` already uses the new name.
 
 ## Numerics
@@ -77,7 +83,7 @@ The solver uses a 5-stage low-storage IMEX Runge-Kutta scheme. Nonlinear advecti
 
 ### Issue tracker
 
-Issues live as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues (`nfrank22-gh/gen-kf-da`). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

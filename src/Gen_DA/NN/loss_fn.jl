@@ -13,10 +13,10 @@ function sliced_wasserstein(P, Q, thetas::AbstractMatrix)
 end
 
 function loss_fn(model::VortFourierDecoder, NDOF, x, ps, st,
-    u_meas_trg, v_meas_trg, spatial_ci, thetas)
+    u_meas_trg, v_meas_trg, sensor_lin, thetas)
   u, v, st = eval_decoder_vel(model, NDOF, x, ps, st)
-  u_meas = u[spatial_ci]
-  v_meas = v[spatial_ci]
+  u_meas = reshape(u, size(u, 1) * size(u, 2), :)[sensor_lin, :]
+  v_meas = reshape(v, size(v, 1) * size(v, 2), :)[sensor_lin, :]
   P = vcat(u_meas, v_meas)
   Q = vcat(u_meas_trg, v_meas_trg)
   return sliced_wasserstein(P, Q, thetas), st

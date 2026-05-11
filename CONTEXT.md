@@ -17,8 +17,16 @@ The curl of the velocity field; the primary variable of the KF solver. Stored in
 _Avoid_: flow state, flow field
 
 **Observation**:
-A sparse sample of the flow used to train or evaluate the generative model. Currently: velocity `(u, v)` at random spatial grid locations sampled from a trajectory. Future: passive tracer particle positions.
+A sparse sample of the flow used to train or evaluate the generative model. Currently: velocity `(u, v)` at a fixed set of spatial grid locations sampled from a trajectory. Future: passive tracer particle positions.
 _Avoid_: measurement, data point
+
+**Sensor Array**:
+The fixed set of spatial grid locations at which velocity observations are taken. Defined once before training and held constant for the entire training run. Represents a real physical sensor layout.
+_Avoid_: measurement locations, observation points, sensor positions
+
+**Training Horizon**:
+The time cutoff `T_train` applied to a trajectory; only snapshots up to `T_train` are used for training. Snapshots after `T_train` form the held-out eval set.
+_Avoid_: training split, train/test split
 
 **Generative Model**:
 The neural network (`VortFourierDecoder`) that maps a latent vector to a vorticity field. Trained to reproduce the distribution of vorticity fields consistent with observations.
@@ -35,9 +43,10 @@ _Avoid_: burn-in, equilibration, warm-up
 ## Relationships
 
 - The **KF solver** produces a **trajectory** (after **spin-up**)
-- A **trajectory** is sampled to produce **observations**
+- A **trajectory** is split at the **training horizon**: snapshots before it are training data, snapshots after are eval data
+- The **sensor array** defines where velocity **observations** are taken from each snapshot
 - The **generative model** takes a **latent vector** and outputs a vorticity field
-- The **generative model** is trained so its output distribution matches the **observations**
+- The **generative model** is trained so its output distribution matches the **observations** at the **sensor array**
 
 ## Example dialogue
 
