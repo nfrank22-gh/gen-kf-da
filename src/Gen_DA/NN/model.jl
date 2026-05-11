@@ -42,9 +42,12 @@ function spectral_pad(omega_hat, N_out)
   half_in   = N_in ÷ 2
   flat      = reshape(omega_hat, nfreq_in, N_in, :)
   batch     = size(flat, 3)
-  padded    = zeros(eltype(omega_hat), nfreq_out, N_out, batch)
-  padded[1:half_in, 1:half_in, :]             = flat[1:half_in, 1:half_in, :]
-  padded[1:half_in, N_out-half_in+1:N_out, :] = flat[1:half_in, N_in-half_in+1:N_in, :]
+  T         = eltype(omega_hat)
+  # Non-mutating pad: cat slices to avoid setindex! (required for Zygote/ChainRules compat)
+  low_x    = flat[1:half_in, 1:half_in, :]
+  high_x   = flat[1:half_in, N_in-half_in+1:N_in, :]
+  top_rows = cat(low_x, zeros(T, half_in, N_out - 2*half_in, batch), high_x; dims=2)
+  padded   = cat(top_rows, zeros(T, nfreq_out - half_in, N_out, batch); dims=1)
   return reshape(padded, nfreq_out, N_out, trailing...)
 end
 
