@@ -1,6 +1,7 @@
 using Gen_DA.NN
 using Gen_DA.NN.DataPipeline
 using Gen_DA.NN.Checkpoint
+using Gen_DA.NN.TrainingPlots
 using Reactant, Random, Lux, Lux.Training, Optimisers, FFTW, Enzyme
 
 Reactant.set_default_backend("cuda")
@@ -26,8 +27,9 @@ function main()
     rng = Xoshiro(123)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    traj_data = load_trajectory(
-        "data/particles/Re$(Re)_N$(N)_npart$(npart)/trajectory.jld2")
+    traj_path = "data/particles/Re$(Re)_N$(N)_npart$(npart)/trajectory.jld2"
+    model_dir = joinpath(dirname(traj_path), "model")
+    traj_data = load_trajectory(traj_path)
     train_snaps, eval_snaps = split_trajectory(
         traj_data.trajectory, traj_data.dt, traj_data.save_every, T_train)
     n_train = size(train_snaps, 3)
@@ -144,12 +146,35 @@ function main()
         "n_slices" => n_slices, "lr" => lr, "use_cosine_lr" => use_cosine_lr,
         "sensor_locations" => sensor_ci,
     )
-    save_checkpoint(
-        "checkpoints/Re$(Re)_N$(N)",
+    save_checkpoint(model_dir,
         tstate.parameters, tstate.states,
         train_losses, eval_swds, eval_epochs,
         config)
-    println("Training complete. Checkpoint saved.")
+    println("Checkpoint saved.")
+
+    # ── Diagnostic plots ──────────────────────────────────────────────────────
+    plot_train_loss_curve(train_losses, model_dir)
+
+    plot_eval_swd_curve(eval_swds, eval_epochs, model_dir)
+
+    # Decode fresh samples on CPU for vorticity panel and energy spectrum
+    cpu = Lux.cpu_device()
+    ps_cpu = cpu(tstate.parameters)
+    st_cpu = cpu(tstate.states)
+    n_plot = 4
+    x_plot = randn(rng, T, latent_dim, n_plot)
+    gen_omega, _ = eval_decoder_vort(model, N, x_plot, ps_cpu, st_cpu)
+    gt_idx = rand(rng, 1:size(eval_snaps, 3), n_plot)
+    gt_omega = eval_snaps[:, :, gt_idx]
+
+    plot_vorticity_panel(gen_omega, gt_omega, model_dir)
+
+    # Spectral arrays: truncate eval_omega_hat to n_plot samples
+    gen_oh_re, gen_oh_im, _ = eval_decoder_vort_hat(model, x_plot, ps_cpu, st_cpu)
+    gen_omega_hat = complex.(gen_oh_re, gen_oh_im)
+    plot_energy_spectrum(gen_omega_hat, eval_omega_hat[:, :, 1:n_plot], model_dir)
+
+    println("Training complete. Checkpoint and plots saved to $model_dir")
 end
 
 main()
