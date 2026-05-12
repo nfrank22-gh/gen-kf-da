@@ -41,7 +41,7 @@ end
 
 function run_no_particles(step, rhs, omega_hat, dt, T_data, save_every, Re, n, N)
     n_steps = round(Int, T_data / dt)
-    dir     = "data/no_particles/Re$(Re)_N$(N)"
+    dir     = "data/no_particles/Re=$(Re)_N=$(N)_dt=$(dt)_T=$(T_data)"
     mkpath(dir)
 
     println("Integrating without particles for $n_steps steps...")
@@ -60,9 +60,9 @@ function main()
     n          = 4
     N          = 128
     dt         = Float32(0.01)
-    T_spinup   = 50.0
-    T_data     = 1000
-    save_every = 10
+    T_spinup   = 50
+    T_data     = 10000
+    save_every = 1000
     npart      = 40
     run_with_particles    = false
     run_without_particles = true

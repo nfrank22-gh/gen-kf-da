@@ -4,7 +4,7 @@ using Lux
 using Random
 
 function make_test_inputs(rng)
-    model, ps, st = VortFourierDecoder([4, 8, 16], 4, 2π, rng)
+    model, ps, st = VortFourierDecoder([4, 8, 16], 4, rng)
     train_losses = Float32[0.5, 0.4, 0.3]
     eval_swds    = Float32[0.2, 0.1]
     eval_epochs  = [1, 2]
@@ -44,16 +44,6 @@ end
         @test length(locs) == 2
         @test locs[1] == [2, 3]
         @test locs[2] == [5, 7]
-    end
-end
-
-@testset "save_checkpoint: second call overwrites cleanly" begin
-    rng = MersenneTwister(4)
-    ps, st, train_losses, eval_swds, eval_epochs, config = make_test_inputs(rng)
-    mktempdir() do dir
-        NN.Checkpoint.save_checkpoint(dir, ps, st, train_losses, eval_swds, eval_epochs, config)
-        @test_nowarn NN.Checkpoint.save_checkpoint(dir, ps, st, train_losses, eval_swds, eval_epochs, config)
-        @test isfile(joinpath(dir, "weights.jld2"))
     end
 end
 

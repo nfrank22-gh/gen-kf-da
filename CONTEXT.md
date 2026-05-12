@@ -40,13 +40,27 @@ _Avoid_: latent code, latent variable, noise vector
 An initial phase of KF solver integration (duration `T_spinup`) that is discarded to allow transients to decay before recording a trajectory.
 _Avoid_: burn-in, equilibration, warm-up
 
+**Sliced Wasserstein Distance (SWD)**:
+The training and evaluation loss. Projects sample sets onto random unit directions and averages the 1-D Wasserstein distance. Used in two forms: observation-space SWD (velocity at sensor locations, trained end-to-end via XLA/Enzyme) and spectral SWD (truncated Fourier coefficients of vorticity, used for eval only).
+_Avoid_: Wasserstein loss, Earth mover's distance, OT loss
+
+**Eval SWD**:
+The spectral-space sliced Wasserstein distance computed every `eval_every` epochs against held-out vorticity snapshots. Measures generalisation to unseen flow states without requiring observations.
+_Avoid_: validation loss, test loss
+
+**Checkpoint**:
+The saved model artefacts written to `<traj_dir>/model/` after training: `weights.jld2` (parameters and state), `train_log.jld2` (loss history), `config.json` (hyperparameters and sensor locations). Optimizer state is deliberately excluded.
+_Avoid_: model save, snapshot, serialized model
+
 ## Relationships
 
 - The **KF solver** produces a **trajectory** (after **spin-up**)
 - A **trajectory** is split at the **training horizon**: snapshots before it are training data, snapshots after are eval data
 - The **sensor array** defines where velocity **observations** are taken from each snapshot
 - The **generative model** takes a **latent vector** and outputs a vorticity field
-- The **generative model** is trained so its output distribution matches the **observations** at the **sensor array**
+- The **generative model** is trained so its output distribution matches the **observations** at the **sensor array** via the **sliced Wasserstein distance**
+- **Eval SWD** tracks generalisation against the held-out eval snapshots in spectral space
+- After training, a **checkpoint** records weights, loss history, and configuration for reproducibility
 
 ## Example dialogue
 
@@ -55,3 +69,6 @@ _Avoid_: burn-in, equilibration, warm-up
 
 > **Dev:** "What does the **generative model** output?"
 > **Domain expert:** "**Vorticity** — specifically its Fourier coefficients. We derive velocity from that when we need to compare against **observations**."
+
+> **Dev:** "How do we know the model is learning?"
+> **Domain expert:** "Two signals: the observation-space **sliced Wasserstein distance** drops during training, and the **eval SWD** against held-out snapshots should decrease too. After training, the **checkpoint** lets us regenerate plots offline."

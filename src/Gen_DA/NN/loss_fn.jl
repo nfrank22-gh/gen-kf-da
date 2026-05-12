@@ -2,15 +2,11 @@ using Statistics
 using Random
 
 function sliced_wasserstein(P, Q, thetas::AbstractMatrix)
-  n_slices = size(thetas, 1)
-  T = eltype(P)
-  loss = zero(T)
-  for i in 1:n_slices
-    θ = thetas[i, :]
-    θ = θ ./ sqrt(sum(abs2, θ))
-    loss += mean(abs.(sort(θ' * P, dims=2) .- sort(θ' * Q, dims=2)))
-  end
-  return loss / n_slices
+    norms = sqrt.(sum(abs2, thetas, dims=2))
+    thetas_n = thetas ./ norms
+    P_proj = sort(thetas_n * P, dims=2)
+    Q_proj = sort(thetas_n * Q, dims=2)
+    return mean(abs.(P_proj .- Q_proj))
 end
 
 function sliced_wasserstein_spectral(P_hat, Q_hat, n_slices::Int; rng=default_rng())
@@ -30,5 +26,24 @@ function loss_fn(model::VortFourierDecoder, NDOF, x, ps, st,
   v_meas = reshape(v, size(v, 1) * size(v, 2), :)[sensor_lin, :]
   P = vcat(u_meas, v_meas)
   Q = vcat(u_meas_trg, v_meas_trg)
+  return sliced_wasserstein(P, Q, thetas), st
+end
+
+function loss_fn_vort(model::VortFourierDecoder, x, ps, st,
+    oh_re_trg, oh_im_trg, thetas)
+  oh_re, oh_im, st = _decode_vort_hat(model, x, ps, st)
+  nfreq, NDOF = size(oh_re, 1), size(oh_re, 2)
+  flat_dim = 2 * nfreq * NDOF
+  P = reshape(vcat(oh_re, oh_im), flat_dim, size(oh_re, 3))
+  Q = reshape(vcat(oh_re_trg, oh_im_trg), flat_dim, size(oh_re_trg, 3))
+  return sliced_wasserstein(P, Q, thetas), st
+end
+
+function loss_fn_vort_state(model::VortFourierDecoder, N_out::Integer, x, ps, st,
+    omega_trg, thetas)
+  omega, st = eval_decoder_vort(model, N_out, x, ps, st)
+  flat_dim = N_out * N_out
+  P = reshape(omega,     flat_dim, size(omega, 3))
+  Q = reshape(omega_trg, flat_dim, size(omega_trg, 3))
   return sliced_wasserstein(P, Q, thetas), st
 end

@@ -2,177 +2,115 @@ using Gen_DA.NN
 using Gen_DA.NN.DataPipeline
 using Gen_DA.NN.Checkpoint
 using Gen_DA.NN.TrainingPlots
-using Reactant, Random, Lux, Lux.Training, Optimisers, FFTW, Enzyme
+using Reactant, Random, Lux
 
 Reactant.set_default_backend("cuda")
-const dev = reactant_device()
 
 function main()
     T             = Float32
     Re            = 100
     N             = 128
-    npart         = 40
-    T_train       = 800.0f0
-    n_meas_space  = 20
-    batch_size    = 100
-    n_epochs      = 200
+    data_dt       = 0.01
+    T_data        = 10000
+    T_train       = 8000.0f0
+    n_meas_space  = 50          # only used when training_mode == :observations
+    batch_size    = 400
+    n_epochs      = 1000
     eval_every    = 10
-    num_freq      = 16
-    latent_dim    = 100
-    layers        = [latent_dim, 512, 1024]
-    n_slices      = 50
-    lr            = 1f-3
-    use_cosine_lr = true
+    num_freq      = 8
+    latent_dim    = 200
+    layers        = [latent_dim, 256, 512]
+    n_slices      = 10000
+    lr                    = 1f-1
+    use_reduce_on_plateau = true
+    plateau_patience     = 10
+    plateau_factor       = 0.5f0
+    plateau_min_lr       = 1f-6
+    fix_thetas    = true
+    fix_x         = true
+    # :observations — sparse velocity at sensor locations (production)
+    # :vorticity    — full spectral vorticity fields (testing simplification)
+    training_mode = :vorticity
 
     rng = Xoshiro(123)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    traj_path = "data/particles/Re$(Re)_N$(N)_npart$(npart)/trajectory.jld2"
+    traj_path = "data/no_particles/Re=$(Re)_N=$(N)_dt=$(data_dt)_T=$(T_data)/trajectory.jld2"
     model_dir = joinpath(dirname(traj_path), "model")
     traj_data = load_trajectory(traj_path)
+
     train_snaps, eval_snaps = split_trajectory(
         traj_data.trajectory, traj_data.dt, traj_data.save_every, T_train)
-    n_train = size(train_snaps, 3)
-    println("Training on $n_train snapshots, eval on $(size(eval_snaps, 3)) snapshots")
+    println("Training on $(size(train_snaps, 3)) snapshots, eval on $(size(eval_snaps, 3)) snapshots")
 
-    # ── Sensor array (fixed throughout training) ───────────────────────────────
-    sensor_ci  = make_sensor_array(N, n_meas_space, rng)
-    sensor_lin = LinearIndices((N, N))[sensor_ci]  # kept as CPU Int array (Reactant constant)
+    # ── Sensor array (observations mode only) ─────────────────────────────────
+    sensor_ci = training_mode == :observations ? make_sensor_array(N, n_meas_space, rng) : nothing
 
-    # ── Model and optimizer ────────────────────────────────────────────────────
-    model, ps, st = VortFourierDecoder(layers, num_freq, T(2π), rng, T)
-    ps = ps |> dev
-    st = st |> dev
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model, ps, st = VortFourierDecoder(layers, num_freq, rng, T)
 
-    opt, lr_schedule = build_optimizer(lr, n_epochs, use_cosine_lr)
-    tstate = Training.TrainState(model, ps, st, opt)
+    # ── Session ───────────────────────────────────────────────────────────────
+    session = TrainingSession(
+        rng, model, ps, st, train_snaps, eval_snaps;
+        training_mode=training_mode, N=N, latent_dim=latent_dim,
+        n_meas_space=n_meas_space, sensor_ci=sensor_ci,
+        n_epochs=n_epochs, eval_every=eval_every,
+        batch_size=batch_size, n_slices=n_slices, lr=lr,
+        use_reduce_on_plateau=use_reduce_on_plateau,
+        plateau_patience=plateau_patience, plateau_factor=plateau_factor,
+        plateau_min_lr=plateau_min_lr,
+        fix_x=fix_x, fix_thetas=fix_thetas,
+    )
 
-    # Loss closure: model, N, sensor_lin are compile-time constants for XLA
-    function train_loss(m, params, states, data)
-        x, u_trg, v_trg, thetas = data
-        l, new_st = loss_fn(m, N, x, params, states, u_trg, v_trg, sensor_lin, thetas)
-        return l, new_st, (;)
-    end
-
-    # ── Compilation ────────────────────────────────────────────────────────────
-    x_dummy      = Reactant.to_rarray(zeros(T, latent_dim, batch_size))
-    u_dummy      = Reactant.to_rarray(zeros(T, n_meas_space, batch_size))
-    v_dummy      = Reactant.to_rarray(zeros(T, n_meas_space, batch_size))
-    thetas_dummy = Reactant.to_rarray(zeros(T, n_slices, 2 * n_meas_space))
-    data_dummy   = (x_dummy, u_dummy, v_dummy, thetas_dummy)
-
-    # Compile the full training step: forward + Enzyme backward + Adam update
-    function step_fn(data, ts)
-        return Training.single_train_step!(AutoEnzyme(), train_loss, data, ts)
-    end
-    compiled_step = @compile step_fn(data_dummy, tstate)
-    println("Compiled training step.")
-
-    # Compile eval forward pass (decoder to omega_hat at model resolution)
-    x_eval_dummy  = Reactant.to_rarray(zeros(T, latent_dim, batch_size))
-    compiled_eval = @compile eval_decoder_vort_hat(
-        model, x_eval_dummy, tstate.parameters, tstate.states)
-    println("Compiled eval forward pass.")
-
-    # ── Precompute truncated spectral eval targets ─────────────────────────────
-    # Map full-N rfft to model's native resolution for SWD comparison
-    NDOF_model  = 2 * num_freq - 1      # 31
-    nfreq_model = num_freq              # 16
-    half_model  = NDOF_model ÷ 2       # 15  (matches spectral_pad's half_in)
-    n_eval      = min(size(eval_snaps, 3), batch_size)
-    eval_omega_hat = zeros(Complex{T}, nfreq_model, NDOF_model, n_eval)
-    for i in 1:n_eval
-        oh = rfft(@view eval_snaps[:, :, i])          # (N÷2+1, N)
-        eval_omega_hat[:, 1:half_model, i]            .= oh[1:nfreq_model, 1:half_model]
-        eval_omega_hat[:, half_model+2:NDOF_model, i] .= oh[1:nfreq_model, N-half_model+1:N]
-        # col half_model+1 (x-freq 15, Nyquist for NDOF_model) stays zero — matches spectral_pad
-    end
-
-    # ── Training loop ──────────────────────────────────────────────────────────
-    train_losses = T[]
-    eval_swds    = T[]
-    eval_epochs  = Int[]
-
-    for epoch in 1:n_epochs
-        # Apply cosine LR schedule before each epoch
-        if lr_schedule !== nothing
-            Optimisers.adjust!(tstate.optimizer_state, eta=lr_schedule(epoch))
-        end
-
-        batches    = batch_partition(n_train, batch_size, rng)
-        epoch_loss = zero(T)
-        n_full     = 0
-
-        for batch_indices in batches
-            length(batch_indices) == batch_size || continue
-
-            u_trg, v_trg = extract_observations(train_snaps, batch_indices, sensor_ci, N)
-            # Fresh latents and projection directions sampled CPU-side, moved to device
-            x      = Reactant.to_rarray(randn(rng, T, latent_dim, batch_size))
-            thetas = Reactant.to_rarray(randn(rng, T, n_slices, 2 * n_meas_space))
-            u_dev  = Reactant.to_rarray(u_trg)
-            v_dev  = Reactant.to_rarray(v_trg)
-
-            _, loss, _, tstate = compiled_step((x, u_dev, v_dev, thetas), tstate)
-
-            epoch_loss += Array(loss)[]
-            n_full += 1
-        end
-
-        avg_loss = epoch_loss / max(n_full, 1)
-        push!(train_losses, avg_loss)
-        println("epoch $epoch  loss = $avg_loss")
-
-        # ── Eval ──────────────────────────────────────────────────────────────
-        if epoch % eval_every == 0
-            x_eval = Reactant.to_rarray(randn(rng, T, latent_dim, n_eval))
-            oh_re, oh_im, _ = compiled_eval(
-                model, x_eval, tstate.parameters, tstate.states)
-            gen_omega_hat = complex.(Array(oh_re), Array(oh_im))
-            swd = sliced_wasserstein_spectral(gen_omega_hat, eval_omega_hat, n_slices; rng)
-            push!(eval_swds, swd)
-            push!(eval_epochs, epoch)
-            println("  eval SWD = $swd")
-        end
-    end
+    # ── Train ─────────────────────────────────────────────────────────────────
+    train!(session)
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
     config = Dict{String, Any}(
-        "Re" => Re, "N" => N, "npart" => npart,
+        "Re" => Re, "N" => N,
         "T_train" => T_train, "n_meas_space" => n_meas_space,
         "batch_size" => batch_size, "n_epochs" => n_epochs,
         "eval_every" => eval_every, "num_freq" => num_freq,
         "latent_dim" => latent_dim, "layers" => layers,
-        "n_slices" => n_slices, "lr" => lr, "use_cosine_lr" => use_cosine_lr,
-        "sensor_locations" => sensor_ci,
+        "n_slices" => n_slices, "lr" => lr,
+        "use_reduce_on_plateau" => use_reduce_on_plateau,
+        "plateau_patience" => plateau_patience, "plateau_factor" => plateau_factor,
+        "plateau_min_lr" => plateau_min_lr,
+        "fix_thetas" => fix_thetas,
+        "fix_x" => fix_x,
+        "training_mode" => string(training_mode),
     )
+    if training_mode == :observations
+        config["sensor_locations"] = sensor_ci
+    end
     save_checkpoint(model_dir,
-        tstate.parameters, tstate.states,
-        train_losses, eval_swds, eval_epochs,
+        session.tstate.parameters, session.tstate.states,
+        session.train_losses, session.eval_swds, session.eval_epochs,
         config)
     println("Checkpoint saved.")
 
     # ── Diagnostic plots ──────────────────────────────────────────────────────
-    plot_train_loss_curve(train_losses, model_dir)
+    plot_train_loss_curve(session.train_losses, model_dir)
+    plot_eval_swd_curve(session.eval_swds, session.eval_epochs, model_dir)
 
-    plot_eval_swd_curve(eval_swds, eval_epochs, model_dir)
-
-    # Decode fresh samples on CPU for vorticity panel and energy spectrum
-    cpu = Lux.cpu_device()
-    ps_cpu = cpu(tstate.parameters)
-    st_cpu = cpu(tstate.states)
+    cpu    = Lux.cpu_device()
+    ps_cpu = cpu(session.tstate.parameters)
+    st_cpu = cpu(session.tstate.states)
+    NDOF_model  = 2 * num_freq - 1
+    nfreq_model = num_freq
     n_plot = 4
     x_plot = randn(rng, T, latent_dim, n_plot)
     gen_omega, _ = eval_decoder_vort(model, N, x_plot, ps_cpu, st_cpu)
-    gt_idx = rand(rng, 1:size(eval_snaps, 3), n_plot)
+    gt_idx   = rand(rng, 1:size(eval_snaps, 3), n_plot)
     gt_omega = eval_snaps[:, :, gt_idx]
-
     plot_vorticity_panel(gen_omega, gt_omega, model_dir)
 
-    # Spectral arrays: truncate eval_omega_hat to n_plot samples
-    gen_oh_re, gen_oh_im, _ = eval_decoder_vort_hat(model, x_plot, ps_cpu, st_cpu)
+    gt_oh_re, gt_oh_im = extract_vorticity_spectral(
+        eval_snaps, collect(1:n_plot), nfreq_model, NDOF_model, N)
+    gt_omega_hat  = complex.(gt_oh_re, gt_oh_im)
+    gen_oh_re, gen_oh_im, _ = NN._decode_vort_hat(model, x_plot, ps_cpu, st_cpu)
     gen_omega_hat = complex.(gen_oh_re, gen_oh_im)
-    plot_energy_spectrum(gen_omega_hat, eval_omega_hat[:, :, 1:n_plot], model_dir)
+    plot_energy_spectrum(gen_omega_hat, gt_omega_hat, model_dir)
 
     println("Training complete. Checkpoint and plots saved to $model_dir")
 end

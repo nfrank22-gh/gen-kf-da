@@ -1,31 +1,28 @@
 using Lux
 using AbstractFFTs
 
-struct VortFourierDecoder{L, T, A<:AbstractArray{T, 2}} <: Lux.AbstractLuxLayer
-  net::L 
-  kx::A
-  ky::A
-end 
+struct VortFourierDecoder{L} <: Lux.AbstractLuxLayer
+  net::L
+  grid::SpectralGrid
+end
 
-function VortFourierDecoder(hidden_layers::AbstractArray{Int, 1}, num_freq::Int, L::Number, rng, T::Type{<:AbstractFloat}=Float32)
+function VortFourierDecoder(hidden_layers::AbstractArray{Int, 1}, num_freq::Int, rng, T::Type{<:AbstractFloat}=Float32)
   NDOF = num_freq * 2 - 1
-  ky_1d = 2π/L .* rfftfreq(NDOF, NDOF)
-  kx_1d = 2π/L .* fftfreq(NDOF, NDOF)
-  ky = T.(reshape(ky_1d, NDOF÷2+1, 1))
-  kx = T.(reshape(kx_1d, 1, NDOF))
+  grid = SpectralGrid(NDOF)
 
   output_dim = (NDOF÷2+1) * NDOF * 2
   net = Chain(
-    [Dense(dim_in => dim_out, gelu) for (dim_in, dim_out) in zip(hidden_layers[1:end-1], hidden_layers[2:end])]...,
+    [Chain(Dense(dim_in => dim_out, gelu), LayerNorm((dim_out,)))
+     for (dim_in, dim_out) in zip(hidden_layers[1:end-1], hidden_layers[2:end])]...,
     Dense(hidden_layers[end] => output_dim)
   )
   ps, st = Lux.setup(rng, net)
-  return VortFourierDecoder(net, kx, ky), ps, st
+  return VortFourierDecoder(net, grid), ps, st
 end
 
-function eval_decoder_vort_hat(model::VortFourierDecoder, x, ps, st)
+function _decode_vort_hat(model::VortFourierDecoder, x, ps, st)
   y, st = model.net(x, ps, st)
-  NDOF = size(model.kx, 2)
+  NDOF = model.grid.N
   nfreq = NDOF ÷ 2 + 1
   batch_size = size(y, 2)
   half = nfreq * NDOF
@@ -52,7 +49,7 @@ function spectral_pad(omega_hat, N_out)
 end
 
 function eval_decoder_vort(model::VortFourierDecoder, N_out::Integer, x, ps, st)
-  omega_hat_re, omega_hat_im, st = eval_decoder_vort_hat(model, x, ps, st)
+  omega_hat_re, omega_hat_im, st = _decode_vort_hat(model, x, ps, st)
   omega_hat = complex.(omega_hat_re, omega_hat_im)
   padded    = spectral_pad(omega_hat, N_out)
   omega     = irfft(padded, N_out, 1:2)
@@ -60,16 +57,14 @@ function eval_decoder_vort(model::VortFourierDecoder, N_out::Integer, x, ps, st)
 end
 
 function eval_decoder_vel(model::VortFourierDecoder, N_out::Integer, x, ps, st)
-  omega_hat_re, omega_hat_im, st = eval_decoder_vort_hat(model, x, ps, st)
+  omega_hat_re, omega_hat_im, st = _decode_vort_hat(model, x, ps, st)
   omega_hat = complex.(omega_hat_re, omega_hat_im)
 
-  kx = model.kx  # (1, NDOF_model), broadcasts over batch dim
-  ky = model.ky  # (NDOF_model÷2+1, 1)
-  dxOp = complex.(zero(kx), kx)   # i*kx as ComplexF32, avoids Complex{Bool}
-  dyOp = complex.(zero(ky), ky)   # i*ky as ComplexF32
-  lap = -(kx.^2 .+ ky.^2)
-  lap[1, 1] = 1
-  psi_hat = omega_hat ./ lap
+  kx = model.grid.kx
+  ky = model.grid.ky
+  dxOp = complex.(zero(kx), kx)
+  dyOp = complex.(zero(ky), ky)
+  psi_hat = omega_hat ./ model.grid.lap
 
   u = irfft(spectral_pad(dyOp .* psi_hat, N_out), N_out, 1:2)
   v = irfft(spectral_pad(.-dxOp .* psi_hat, N_out), N_out, 1:2)

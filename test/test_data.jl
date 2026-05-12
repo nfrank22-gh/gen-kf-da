@@ -46,31 +46,54 @@ end
     @test length(batches[end]) == 1      # last batch has remainder
 end
 
+@testset "DataPipeline.extract_vorticity_spectral" begin
+    using FFTW
+    N = 16
+    nfreq = 4
+    NDOF = 2 * nfreq - 1   # 7
+    half = NDOF ÷ 2        # 3
+
+    rng = MersenneTwister(11)
+    snaps = randn(rng, Float32, N, N, 3)
+    indices = [1, 3]
+
+    oh_re, oh_im = NN.DataPipeline.extract_vorticity_spectral(snaps, indices, nfreq, NDOF, N)
+
+    @test size(oh_re) == (nfreq, NDOF, 2)
+    @test size(oh_im) == (nfreq, NDOF, 2)
+
+    for (b, idx) in enumerate(indices)
+        oh = rfft(snaps[:, :, idx])
+        # positive-kx window
+        @test oh_re[:, 1:half, b]      ≈ real.(oh[1:nfreq, 1:half])
+        @test oh_im[:, 1:half, b]      ≈ imag.(oh[1:nfreq, 1:half])
+        # negative-kx window
+        @test oh_re[:, half+2:NDOF, b] ≈ real.(oh[1:nfreq, N-half+1:N])
+        @test oh_im[:, half+2:NDOF, b] ≈ imag.(oh[1:nfreq, N-half+1:N])
+        # Nyquist column stays zero
+        @test all(iszero, oh_re[:, half+1, b])
+        @test all(iszero, oh_im[:, half+1, b])
+    end
+end
+
 @testset "DataPipeline.extract_observations" begin
     using FFTW
     N = 8
-    L = 2π
-    dx = Float32(L / N)
 
-    # Random vorticity snapshot with fixed seed
     rng = MersenneTwister(7)
     omega = randn(rng, Float32, N, N)
 
-    # Hand-compute expected u, v using the same spectral ops as rhs.jl
-    ky_1d = Float32.(2π .* rfftfreq(N, 1/dx))
-    kx_1d = Float32.(2π .* fftfreq(N, 1/dx))
-    KY = reshape(ky_1d, N÷2+1, 1)
-    KX = reshape(kx_1d, 1, N)
-    lap = -(KX.^2 .+ KY.^2)
-    lap[1, 1] = 1f0
-    omega_hat = rfft(omega)
-    psi_hat   = omega_hat ./ complex.(lap)
-    u_expected = irfft(complex.(zero(KY), KY) .* psi_hat, N)
-    v_expected = irfft(complex.(zero(KX), .-KX) .* psi_hat, N)
+    grid = SpectralGrid(N)
+
+    # Hand-compute expected u, v using SpectralGrid operators
+    omega_hat  = rfft(omega)
+    psi_hat    = omega_hat ./ complex.(grid.lap)
+    u_expected = irfft(complex.(zero(grid.ky), grid.ky) .* psi_hat, N)
+    v_expected = irfft(complex.(zero(grid.kx), .-grid.kx) .* psi_hat, N)
 
     sensor_ci = [CartesianIndex(2, 3), CartesianIndex(5, 7)]
     snaps = reshape(omega, N, N, 1)
-    u_meas, v_meas = NN.DataPipeline.extract_observations(snaps, [1], sensor_ci, N)
+    u_meas, v_meas = NN.DataPipeline.extract_observations(snaps, [1], sensor_ci, grid)
 
     @test size(u_meas) == (2, 1)
     @test size(v_meas) == (2, 1)

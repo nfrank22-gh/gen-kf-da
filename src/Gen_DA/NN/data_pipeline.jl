@@ -3,8 +3,9 @@ module DataPipeline
 using FFTW
 using JLD2
 using Random
+import ..SpectralGrid
 
-export load_trajectory, split_trajectory, make_sensor_array, batch_partition, extract_observations
+export load_trajectory, split_trajectory, make_sensor_array, batch_partition, extract_observations, extract_vorticity_spectral
 
 function load_trajectory(path::String)
     f = jldopen(path)
@@ -29,41 +30,49 @@ function batch_partition(n_train::Int, batch_size::Int, rng::AbstractRNG)
     return [indices[i:min(i + batch_size - 1, n_train)] for i in 1:batch_size:n_train]
 end
 
-const _L = Float32(2π)
-
-function _spectral_ops(N::Int)
-    dx = _L / N
-    ky_1d = Float32.(2π .* rfftfreq(N, 1/dx))
-    kx_1d = Float32.(2π .* fftfreq(N, 1/dx))
-    KY = reshape(ky_1d, N÷2+1, 1)
-    KX = reshape(kx_1d, 1, N)
-    lap = -(KX.^2 .+ KY.^2)
-    lap[1, 1] = 1f0
-    return KX, KY, lap
-end
-
 function extract_observations(
     snaps::AbstractArray{Float32,3},
     indices::AbstractVector{Int},
     sensor_ci::AbstractVector{<:CartesianIndex{2}},
-    N::Int,
+    grid::SpectralGrid,
 )
-    KX, KY, lap = _spectral_ops(N)
     n_meas = length(sensor_ci)
     batch_size = length(indices)
     u_meas = zeros(Float32, n_meas, batch_size)
     v_meas = zeros(Float32, n_meas, batch_size)
     for (b, idx) in enumerate(indices)
         omega_hat = rfft(@view snaps[:, :, idx])
-        psi_hat   = omega_hat ./ complex.(lap)
-        u = irfft(complex.(zero(KY), KY) .* psi_hat, N)
-        v = irfft(complex.(zero(KX), .-KX) .* psi_hat, N)
+        psi_hat   = omega_hat ./ complex.(grid.lap)
+        u = irfft(complex.(zero(grid.ky), grid.ky) .* psi_hat, grid.N)
+        v = irfft(complex.(zero(grid.kx), .-grid.kx) .* psi_hat, grid.N)
         for (m, ci) in enumerate(sensor_ci)
             u_meas[m, b] = u[ci]
             v_meas[m, b] = v[ci]
         end
     end
     return u_meas, v_meas
+end
+
+function extract_vorticity_spectral(
+    snaps::AbstractArray{Float32,3},
+    indices::AbstractVector{Int},
+    nfreq::Int,
+    NDOF::Int,
+    N::Int,
+)
+    half = NDOF ÷ 2
+    n_batch = length(indices)
+    oh_re = zeros(Float32, nfreq, NDOF, n_batch)
+    oh_im = zeros(Float32, nfreq, NDOF, n_batch)
+    for (b, idx) in enumerate(indices)
+        oh = rfft(@view snaps[:, :, idx])   # (N÷2+1, N)
+        oh_re[:, 1:half, b]        .= real.(oh[1:nfreq, 1:half])
+        oh_im[:, 1:half, b]        .= imag.(oh[1:nfreq, 1:half])
+        oh_re[:, half+2:NDOF, b]   .= real.(oh[1:nfreq, N-half+1:N])
+        oh_im[:, half+2:NDOF, b]   .= imag.(oh[1:nfreq, N-half+1:N])
+        # column half+1 (Nyquist for NDOF) stays zero
+    end
+    return oh_re, oh_im
 end
 
 end # module DataPipeline
