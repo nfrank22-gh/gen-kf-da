@@ -9,7 +9,7 @@ We chose a two-phase training strategy with optional **relaxation** (running the
 
 **Alternatives considered:**
 
-- *Full backprop through a long solver rollout*: chaotic Lyapunov instabilities make gradients numerically useless past a few steps. Rejected for any `T_relax` beyond O(0.1) time units.
+- *Full backprop through a long solver rollout*: chaotic Lyapunov instabilities could amplify gradients. For Re=100 the Lyapunov timescale is ~3.3 time units, so T_relax up to ~2.0 is well within the gradient-stable regime; longer horizons warrant care.
 - *Stop-gradient at the solver boundary*: the upsampling model receives no gradient signal from the relaxed output, requiring a separate loss on its direct output (effectively phase 1 only). Rejected because it gives up on joint training entirely.
 - *Two-phase with baked-in phase switching inside `TrainingSession`*: more monolithic; harder to skip phase 2 or checkpoint between phases. Rejected in favour of two separate `TrainingSession` objects constructed sequentially in `train_ctrl.jl`.
 
@@ -17,10 +17,35 @@ We chose a two-phase training strategy with optional **relaxation** (running the
 
 ## Phase-2 gradient compilation strategy
 
-`loss_fn_relaxation` runs a Julia `for` loop over `n_steps` KF solver steps. When `Training.single_train_step!(AutoEnzyme(), ...)` traces this, Reactant fully unrolls the loop into the MLIR graph. For large `n_steps` (e.g., `T_relax=2.0`, `dt_relax=0.01` → 200 steps × 5 RK stages) the MLIR graph contains thousands of element-wise ops (one `*_broadcast_scalar` per complex multiplication per unrolled step), causing compilation to hang or fail with a naming-uniqueness error.
+### Root cause of the original hang
 
-**Decision**: annotate the outer `for` loop in `relax()` with `Reactant.@trace`. Inside a `@compile` context, `@trace` promotes the loop bounds to traced values and lowers the loop to a single `stablehlo.while` op instead of unrolling — the entire 200-step rollout becomes one native XLA loop, which XLA differentiates at the HLO level. Outside `@compile` (CPU tests, plain Julia calls), `@trace` is a no-op and the loop runs normally. `Training.single_train_step!` continues to be used unchanged; the fix is entirely inside `relax()`.
+`loss_fn_relaxation` ran a Julia `for` loop inside `Training.single_train_step!(AutoEnzyme(), ...)`. Two approaches were tried:
 
-**Alternatives considered**: pre-compiling the full loss+gradient in a separate `Reactant.@compile` call with `Enzyme.autodiff` inside, bypassing `Training.single_train_step!`. Rejected because calling `Enzyme.autodiff` inside a `@compile` context triggers nested MLIR function generation that replicates the same naming-uniqueness conflict as loop unrolling.
+1. **Unrolled loop** (no `@trace`): Reactant unrolls n_steps into the MLIR graph. For n_steps=200 × 5 RK stages, thousands of ops cause a naming-uniqueness error or indefinitely slow compilation.
 
-**Future**: when a neural operator replaces the KF solver as the fine-tuner, `freeze_upsampler = true` becomes meaningful (train only the operator). Full backprop through the operator is expected to be stable since it lacks chaotic Lyapunov growth.
+2. **`@trace`**: converts the loop to `stablehlo.while`. This fixes the forward compilation but Enzyme-MLIR cannot differentiate through `stablehlo.while` — compilation hangs on the backward pass even for n_steps=10.
+
+### Current decision: manual adjoint with split compilation
+
+The phase-2 training loop bypasses `Training.single_train_step!` for the solver chain entirely. It uses three separately compiled functions plus the standard Enzyme-compiled upsampler VJP:
+
+| Step | Function | Compiled by |
+|------|----------|-------------|
+| Forward | `_phase2_forward` (upsampler + `relax_and_store`) | `Reactant.@compile` |
+| SWD + gradient | `_swd_adjoint_cpu` | CPU, pure Julia |
+| Backward | `relax_adj_full` (solver adjoint) | `Reactant.@compile` |
+| Param update | VJP inner-product loss | `Training.single_train_step!` / Enzyme |
+
+`relax_and_store` stores `omega_hat` at all n_steps+1 steps as a 4-D array `(N÷2+1, N, batch, n_steps+1)`. The loop is unrolled at trace time (n_steps is a compile-time constant); no Enzyme is involved — just a chain of XLA ops. Compilation is bounded and slow for large n_steps but never hangs.
+
+`relax_adj_full` runs `_kf_step_batched_adjoint` backward through the stored trajectory. Each call re-runs the 5-stage IMEX RK forward from the stored checkpoint to recover intermediate states, then applies the exact spectral adjoint. Enzyme is not invoked for this path.
+
+The upsampler VJP uses the identity: gradient of `sum(omega_gen .* d_omega_gen)` w.r.t. `params` equals `J_upsampler^T * d_omega_gen`. `Training.single_train_step!(AutoEnzyme(), vjp_loss, ...)` compiles and applies this correctly since the upsampler has no solver loops.
+
+**Memory**: the trajectory tensor is `(N÷2+1) × N × batch × (n_steps+1)` complex Float32. For N=128, batch=801, n_steps=200: ~10.8 GB. Fits in the 25 GB BFC allocator with margin; can reduce batch_size if needed.
+
+**Compilation time**: each compiled function unrolls n_steps iterations. For n_steps=200 this takes several minutes on first call; subsequent epochs reuse the cached compiled function.
+
+**Alternative considered and rejected**: `EnzymeRules.augmented_primal` / `reverse` for `relax()`. The tape would need to carry the trajectory as an XLA tuple through Enzyme-MLIR's custom rule mechanism, whose interaction with Reactant's compilation pipeline is uncertain. The manual split-compilation approach is simpler and guaranteed to work.
+
+**Future**: when a neural operator replaces the KF solver as the fine-tuner, `freeze_upsampler = true` becomes meaningful (train only the operator). Full backprop through the operator via Enzyme is expected to be stable since it lacks solver-loop compilation issues.

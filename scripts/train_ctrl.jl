@@ -16,10 +16,10 @@ function main()
     T_train       = 8000.0f0
     n_meas_space  = 50          # only used when training_mode == :observations
     batch_size    = 801
-    n_epochs      = 10
+    n_epochs      = 100
     eval_every    = 100
-    latent_dim    = 16
-    n_slices      = 10000
+    latent_dim    = 100
+    n_slices      = 500
     lr                    = 1f-3
     use_reduce_on_plateau = true
     plateau_patience     = 10
@@ -29,16 +29,16 @@ function main()
     fix_x         = false
     # :observations — sparse velocity at sensor locations (production)
     # :vorticity    — full spectral vorticity fields (testing simplification)
-    training_mode = :vorticity
+    training_mode = :observations
 
     # ── Phase 2: Relaxation training ──────────────────────────────────────────
     # Runs the KF solver for T_relax from the upsampler output, then computes
     # SWD on the relaxed field.  Backprop flows through the short solver rollout
     # into the upsampler weights.  Set run_phase2 = false to skip entirely.
-    run_phase2        = true
-    T_relax           = 2f0   # physical time to run the solver per sample
+    run_phase2        = false
+    T_relax           = 0.1f0   # physical time to run the solver per sample
     dt_relax          = 0.01f0  # solver timestep for relaxation
-    n_epochs_phase2   = 2
+    n_epochs_phase2   = 100
     eval_every_phase2 = 10
     lr_phase2         = 1f-3
     freeze_upsampler  = false   # no-op when fine-tuner has no learnable params
@@ -58,7 +58,7 @@ function main()
     elseif model_arch == :conv
         act               = gelu
         init_channels     = 32
-        fc_hidden         = [128]             # intermediate FC widths; final output is derived
+        fc_hidden         = [512]             # intermediate FC widths; final output is derived
         n_upsample_blocks = 3                 # starting resolution = N ÷ 2^n_upsample_blocks = 8
         conv_channels     = [32, 16, 8]  # C_out after 1×1 proj in each upsampling block
         n_convs_per_block = 4
@@ -85,12 +85,15 @@ function main()
     sensor_ci = training_mode == :observations ? make_sensor_array(N, n_meas_space, rng) : nothing
 
     # ── Session ───────────────────────────────────────────────────────────────
+    mode = if training_mode == :observations
+        ObservationsMode(train_snaps, N, batch_size, n_meas_space, sensor_ci)
+    else
+        VorticityMode(train_snaps, N, batch_size)
+    end
     session = TrainingSession(
-        rng, model, ps, st, train_snaps, eval_snaps;
-        training_mode=training_mode, N=N, latent_dim=latent_dim,
-        n_meas_space=n_meas_space, sensor_ci=sensor_ci,
-        n_epochs=n_epochs, eval_every=eval_every,
-        batch_size=batch_size, n_slices=n_slices, lr=lr,
+        rng, model, ps, st, train_snaps, eval_snaps, mode;
+        latent_dim=latent_dim, n_epochs=n_epochs, eval_every=eval_every,
+        n_slices=n_slices, lr=lr,
         use_reduce_on_plateau=use_reduce_on_plateau,
         plateau_patience=plateau_patience, plateau_factor=plateau_factor,
         plateau_min_lr=plateau_min_lr,
@@ -185,17 +188,15 @@ function main()
         GC.gc(true)
         GC.gc(true)   # second pass ensures PJRT buffer finalizers run
 
+        mode2 = RelaxationMode(train_snaps, N, batch_size, rhs_relax, n_steps_relax, dt_relax)
         session2 = TrainingSession(
-            rng, model, ps_p2, st_p2, train_snaps, eval_snaps;
-            training_mode=:relaxation, N=N, latent_dim=latent_dim,
-            n_epochs=n_epochs_phase2, eval_every=eval_every_phase2,
-            batch_size=batch_size, n_slices=n_slices, lr=lr_phase2,
+            rng, model, ps_p2, st_p2, train_snaps, eval_snaps, mode2;
+            latent_dim=latent_dim, n_epochs=n_epochs_phase2, eval_every=eval_every_phase2,
+            n_slices=n_slices, lr=lr_phase2,
             use_reduce_on_plateau=use_reduce_on_plateau,
             plateau_patience=plateau_patience, plateau_factor=plateau_factor,
             plateau_min_lr=plateau_min_lr,
             fix_x=fix_x, fix_thetas=fix_thetas,
-            rhs_relax=rhs_relax, n_steps_relax=n_steps_relax, dt_relax=dt_relax,
-            freeze_upsampler=freeze_upsampler,
         )
 
         train!(session2)
@@ -229,7 +230,8 @@ function main()
 
         ps_p2_cpu = cpu(session2.tstate.parameters)
         st_p2_cpu = cpu(session2.tstate.states)
-        gen_omega_p2, _ = eval_decoder_vort(model, N, x_plot, ps_p2_cpu, st_p2_cpu)
+        relaxed_dec = RelaxedDecoder(model, rhs_relax, n_steps_relax, dt_relax)
+        gen_omega_p2, _ = relaxed_dec(N, x_plot, ps_p2_cpu, st_p2_cpu)
         plot_vorticity_panel(gen_omega_p2, gt_omega, phase2_dir)
 
         println("Phase 2 training complete. Results saved to $phase2_dir")

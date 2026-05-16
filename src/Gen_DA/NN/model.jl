@@ -31,22 +31,6 @@ function _decode_vort_hat(model::VortFourierDecoder, x, ps, st)
   return omega_hat_re, omega_hat_im, st
 end
 
-function spectral_pad(omega_hat, N_out)
-  nfreq_in  = size(omega_hat, 1)
-  N_in      = size(omega_hat, 2)
-  trailing  = size(omega_hat)[3:end]
-  nfreq_out = N_out ÷ 2 + 1
-  half_in   = N_in ÷ 2
-  flat      = reshape(omega_hat, nfreq_in, N_in, :)
-  batch     = size(flat, 3)
-  T         = eltype(omega_hat)
-  # Non-mutating pad: cat slices to avoid setindex! (required for Zygote/ChainRules compat)
-  low_x    = flat[1:half_in, 1:half_in, :]
-  high_x   = flat[1:half_in, N_in-half_in+1:N_in, :]
-  top_rows = cat(low_x, zeros(T, half_in, N_out - 2*half_in, batch), high_x; dims=2)
-  padded   = cat(top_rows, zeros(T, nfreq_out - half_in, N_out, batch); dims=1)
-  return reshape(padded, nfreq_out, N_out, trailing...)
-end
 
 function eval_decoder_vort(model::VortFourierDecoder, N_out::Integer, x, ps, st)
   omega_hat_re, omega_hat_im, st = _decode_vort_hat(model, x, ps, st)
@@ -59,15 +43,7 @@ end
 function eval_decoder_vel(model::VortFourierDecoder, N_out::Integer, x, ps, st)
   omega_hat_re, omega_hat_im, st = _decode_vort_hat(model, x, ps, st)
   omega_hat = complex.(omega_hat_re, omega_hat_im)
-
-  kx = model.grid.kx
-  ky = model.grid.ky
-  dxOp = complex.(zero(kx), kx)
-  dyOp = complex.(zero(ky), ky)
   psi_hat = omega_hat ./ model.grid.lap
-
-  u = irfft(spectral_pad(dyOp .* psi_hat, N_out), N_out, 1:2)
-  v = irfft(spectral_pad(.-dxOp .* psi_hat, N_out), N_out, 1:2)
-
+  u, v = velocity_from_psi_hat(model.grid, psi_hat, N_out)
   return u, v, st
 end

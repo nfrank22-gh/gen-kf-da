@@ -143,14 +143,9 @@ function eval_decoder_vort(model::ConvDecoder, ::Integer, x, ps, st)
 end
 
 function eval_decoder_vel(model::ConvDecoder, N_out::Integer, x, ps, st)
-    omega, st   = model(x, ps, st)
-    omega_hat   = rfft(omega, 1:2)
-    kx          = model.grid.kx
-    ky          = model.grid.ky
-    dxOp        = complex.(zero(kx), kx)
-    dyOp        = complex.(zero(ky), ky)
-    psi_hat     = omega_hat ./ model.grid.lap
-    u = irfft(dyOp   .* psi_hat, N_out, 1:2)
-    v = irfft(.-dxOp .* psi_hat, N_out, 1:2)
+    omega, st = model(x, ps, st)
+    omega_hat = rfft(omega, 1:2)
+    psi_hat   = omega_hat ./ model.grid.lap
+    u, v = velocity_from_psi_hat(model.grid, psi_hat)
     return u, v, st
 end

@@ -3,7 +3,7 @@ module DataPipeline
 using FFTW
 using JLD2
 using Random
-import ..SpectralGrid
+import ..SpectralGrid, ..velocity_from_psi_hat
 
 export load_trajectory, split_trajectory, make_sensor_array, batch_partition, extract_observations, extract_vorticity_spectral
 
@@ -43,8 +43,7 @@ function extract_observations(
     for (b, idx) in enumerate(indices)
         omega_hat = rfft(@view snaps[:, :, idx])
         psi_hat   = omega_hat ./ complex.(grid.lap)
-        u = irfft(complex.(zero(grid.ky), grid.ky) .* psi_hat, grid.N)
-        v = irfft(complex.(zero(grid.kx), .-grid.kx) .* psi_hat, grid.N)
+        u, v = velocity_from_psi_hat(grid, psi_hat)
         for (m, ci) in enumerate(sensor_ci)
             u_meas[m, b] = u[ci]
             v_meas[m, b] = v[ci]
