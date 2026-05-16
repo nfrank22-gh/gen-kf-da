@@ -25,7 +25,7 @@ function kolmogorov_forcing(L, N, n; T=Float32)
     return T(-n) .* cos.(T(n) .* Y)
 end
 
-struct KfRhs{T<:AbstractFloat, RA, CA}
+struct KfRhs{T, RA, CA}
     M::RA
     dyOp::CA
     dxOp::CA
