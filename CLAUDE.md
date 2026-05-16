@@ -90,6 +90,7 @@ test/
 | `num_freq` | 8 | Spectral resolution (NDOF = 2·num_freq−1 = 15) |
 | `latent_dim` | 200 | Latent vector dimension |
 | `layers` | [200, 256, 512] | MLP hidden layer widths (first entry = latent_dim) |
+| `N_conv` | `N` | ConvDecoder conv backbone output resolution; Fourier-interpolated to N after final conv; N/N_conv must be a power of 2 |
 | `n_slices` | 10000 | SWD projection directions per batch |
 | `lr` | 0.1 | Adam learning rate |
 | `use_reduce_on_plateau` | true | Enable ReduceOnPlateau LR scheduler |

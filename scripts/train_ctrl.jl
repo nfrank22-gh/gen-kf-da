@@ -10,11 +10,11 @@ Reactant.set_default_backend("cuda")
 function main()
     T             = Float32
     Re            = 40
-    N             = 64
+    N             = 128
     data_dt       = 0.01
     T_data        = 10000
     T_train       = 8000.0f0
-    n_meas_space  = 200          # only used when training_mode == :observations
+    n_meas_space  = Inf          # only used when training_mode == :observations
     batch_size    = 801
     n_epochs      = 1000
     eval_every    = 100
@@ -29,7 +29,7 @@ function main()
     kl_weight          = 1f0   # beta-VAE weight on KL(N(mu,sigma²) || N(0,I))
     # :observations — sparse velocity at sensor locations (production)
     # :vorticity    — full spectral vorticity fields (testing simplification)
-    training_mode = :vorticity
+    training_mode = :observations
 
     # ── Phase 2: Neural Operator finetuning ───────────────────────────────────
     # Wraps the phase-1 upsampler with a FourierNeuralOperator trained jointly
@@ -73,16 +73,17 @@ function main()
         act               = gelu
         init_channels     = 64
         fc_hidden         = [512]             # intermediate FC widths; final output is derived
-        n_upsample_blocks = 4                 # starting resolution = N ÷ 2^n_upsample_blocks = 8
+        n_upsample_blocks = 4                 # starting resolution = N_conv ÷ 2^n_upsample_blocks
         conv_channels     = [64, 32, 16, 8]  # C_out after 1×1 proj in each upsampling block
         n_convs_per_block = 4
         kernel_size       = 3
         norm_type         = :batch             # :none | :batch | :group
         n_groups          = 8                 # only used when norm_type == :group
+        N_conv            = div(N, 2)                 # conv backbone output resolution; N/N_conv must be a power of 2
         model, ps, st = ConvDecoder(latent_dim, fc_hidden, init_channels,
                                     n_upsample_blocks, conv_channels,
                                     n_convs_per_block, kernel_size,
-                                    act, norm_type, n_groups, N, rng, T)
+                                    act, norm_type, n_groups, N_conv, N, rng, T)
     end
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ function main()
     println("Training on $(size(train_snaps, 3)) snapshots, eval on $(size(eval_snaps, 3)) snapshots")
 
     # ── Sensor array (observations mode only) ─────────────────────────────────
-    sensor_ci = training_mode == :observations ? make_sensor_array(N, n_meas_space, rng) : nothing
+    sensor_ci = (training_mode == :observations && !isinf(n_meas_space)) ? make_sensor_array(N, n_meas_space, rng) : nothing
 
     # ── Eval plot data (shared by phase-1 and phase-2 vorticity panels) ───────
     n_plot   = 4
@@ -128,7 +129,7 @@ function main()
         config = Dict{String, Any}(
             "Re" => Re, "N" => N,
             "model_arch" => string(model_arch),
-            "T_train" => T_train, "n_meas_space" => n_meas_space,
+            "T_train" => T_train, "n_meas_space" => isinf(n_meas_space) ? "all" : n_meas_space,
             "batch_size" => batch_size, "n_epochs" => n_epochs,
             "eval_every" => eval_every,
             "latent_dim" => latent_dim,
@@ -146,6 +147,7 @@ function main()
         elseif model_arch == :conv
             config["init_channels"]     = init_channels
             config["fc_hidden"]         = fc_hidden
+            config["N_conv"]            = N_conv
             config["n_upsample_blocks"] = n_upsample_blocks
             config["conv_channels"]     = conv_channels
             config["n_convs_per_block"] = n_convs_per_block

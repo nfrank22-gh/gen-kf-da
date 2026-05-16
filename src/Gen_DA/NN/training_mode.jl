@@ -52,10 +52,37 @@ function VorticityMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int;
 end
 
 function ObservationsMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int,
-                          n_meas_space::Int, sensor_ci;
+                          n_meas_space, sensor_ci;
                           freeze_upsampler::Bool=false, kl_weight::Float32=0f0)
-    n_full     = size(train_snaps, 3) ÷ batch_size
-    data_grid  = SpectralGrid(N)
+    n_full    = size(train_snaps, 3) ÷ batch_size
+    data_grid = SpectralGrid(N)
+
+    if isinf(n_meas_space)
+        # Full N×N velocity field: SWD over all N² u and v values
+        sensor_lin = LinearIndices((N, N))[:]
+        prepare_epoch_fn = function(full_batches)
+            u_cpu = zeros(Float32, N * N, batch_size * n_full)
+            v_cpu = zeros(Float32, N * N, batch_size * n_full)
+            for (i, batch_indices) in enumerate(full_batches)
+                cols = (i-1)*batch_size+1 : i*batch_size
+                u_cpu[:, cols], v_cpu[:, cols] =
+                    DataPipeline.extract_full_velocity(train_snaps, batch_indices, data_grid)
+            end
+            return u_cpu, v_cpu
+        end
+        get_data_batch_fn = function(data_all, cols)
+            u_all, v_all = data_all
+            return (Reactant.to_rarray(u_all[:, cols]), Reactant.to_rarray(v_all[:, cols]))
+        end
+        train_loss_fn = function(m, params, states, data)
+            u_trg, v_trg, thetas, cols, eps = data
+            l, new_st = loss_fn(m, N, params, states, u_trg, v_trg, sensor_lin, thetas, cols, eps, kl_weight)
+            l, new_st, (;)
+        end
+        return ObservationsMode(batch_size, n_full, 2 * N * N, freeze_upsampler,
+                                prepare_epoch_fn, get_data_batch_fn, train_loss_fn)
+    end
+
     sensor_lin = LinearIndices((N, N))[sensor_ci]
     prepare_epoch_fn = function(full_batches)
         u_cpu = zeros(Float32, n_meas_space, batch_size * n_full)

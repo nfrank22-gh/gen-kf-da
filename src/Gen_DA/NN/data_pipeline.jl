@@ -5,7 +5,7 @@ using JLD2
 using Random
 import ..SpectralGrid, ..velocity_from_psi_hat
 
-export load_trajectory, split_trajectory, make_sensor_array, batch_partition, extract_observations, extract_vorticity_spectral
+export load_trajectory, split_trajectory, make_sensor_array, batch_partition, extract_observations, extract_full_velocity, extract_vorticity_spectral
 
 function load_trajectory(path::String)
     f = jldopen(path)
@@ -50,6 +50,25 @@ function extract_observations(
         end
     end
     return u_meas, v_meas
+end
+
+function extract_full_velocity(
+    snaps::AbstractArray{Float32,3},
+    indices::AbstractVector{Int},
+    grid::SpectralGrid,
+)
+    N = grid.N
+    batch_size = length(indices)
+    u_full = zeros(Float32, N * N, batch_size)
+    v_full = zeros(Float32, N * N, batch_size)
+    for (b, idx) in enumerate(indices)
+        omega_hat = rfft(@view snaps[:, :, idx])
+        psi_hat   = omega_hat ./ complex.(grid.lap)
+        u, v = velocity_from_psi_hat(grid, psi_hat)
+        u_full[:, b] = vec(u)
+        v_full[:, b] = vec(v)
+    end
+    return u_full, v_full
 end
 
 function extract_vorticity_spectral(

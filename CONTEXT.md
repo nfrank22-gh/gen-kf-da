@@ -41,7 +41,7 @@ The MLP-based upsampling model architecture. An MLP maps the latent vector to Fo
 _Avoid_: Fourier decoder, spectral decoder
 
 **ConvDecoder**:
-The convolutional upsampling model architecture. FC layers map the latent vector to a small spatial feature map, which is progressively upsampled to N×N via a series of spectral upsampling blocks, then collapsed to a 1-channel vorticity field by a final convolution.
+The convolutional upsampling model architecture. FC layers map the latent vector to a small spatial feature map, which is progressively upsampled to `N_conv×N_conv` via a series of spectral upsampling blocks, then collapsed to a 1-channel vorticity field by a final convolution. If `N_conv < N`, a final Fourier interpolation step (repeated spectral 2× upsampling) brings the output to the full `N×N` training resolution. `N / N_conv` must be a power of 2. When `N_conv = N` no interpolation step is applied and the behaviour is identical to the original architecture.
 _Avoid_: conv decoder, upsampling decoder
 
 **Physics Refinement**:

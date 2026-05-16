@@ -20,7 +20,7 @@ function save_checkpoint(dir, ps, st, train_losses, eval_swds, eval_epochs, conf
     serializable = Dict{String,Any}()
     for (k, v) in config
         if k == "sensor_locations"
-            serializable[k] = [[ci[1], ci[2]] for ci in v]
+            serializable[k] = isnothing(v) ? nothing : [[ci[1], ci[2]] for ci in v]
         else
             serializable[k] = v
         end

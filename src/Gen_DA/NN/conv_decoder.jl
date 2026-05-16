@@ -93,14 +93,18 @@ struct ConvDecoder{FC, BL, FN} <: Lux.AbstractLuxContainerLayer{(:fc, :blocks, :
     final_conv::FN
     grid::SpectralGrid
     H0::Int
+    N_conv::Int       # conv backbone output resolution
+    n_interp_steps::Int  # log2(N / N_conv) spectral upsample steps after final_conv
 end
 
 function ConvDecoder(latent_dim::Int, fc_hidden::Vector{Int}, init_channels::Int,
                      n_upsample_blocks::Int, conv_channels::Vector{Int},
                      n_convs_per_block::Int, kernel_size::Int,
                      act, norm_type::Symbol, n_groups::Int,
-                     N::Int, rng, T::Type{<:AbstractFloat}=Float32)
-    H0     = N ÷ (2^n_upsample_blocks)
+                     N_conv::Int, N::Int, rng, T::Type{<:AbstractFloat}=Float32)
+    @assert N % N_conv == 0 && ispow2(N ÷ N_conv) "N/N_conv must be a power of 2, got N=$N, N_conv=$N_conv"
+    n_interp_steps = Int(log2(N ÷ N_conv))
+    H0     = N_conv ÷ (2^n_upsample_blocks)
     fc_out = init_channels * H0 * H0
 
     # FC: latent_dim → [hidden → LayerNorm]... → fc_out  (no act on final layer)
@@ -121,7 +125,7 @@ function ConvDecoder(latent_dim::Int, fc_hidden::Vector{Int}, init_channels::Int
     final_conv = CircConv(conv_channels[end], 1, kernel_size)
 
     grid  = SpectralGrid(N)
-    model = ConvDecoder(fc, blocks, final_conv, grid, H0)
+    model = ConvDecoder(fc, blocks, final_conv, grid, H0, N_conv, n_interp_steps)
     ps, st = Lux.setup(rng, model)
     return model, ps, st
 end
@@ -133,6 +137,13 @@ function (model::ConvDecoder)(x, ps, st)
     h, st_bl  = model.blocks(h, ps.blocks, st.blocks)
     h4, st_fn = model.final_conv(h, ps.final_conv, st.final_conv)
     omega     = reshape(h4, size(h4, 1), size(h4, 2), size(h4, 4))
+    if model.n_interp_steps > 0
+        omega4 = reshape(omega, size(omega, 1), size(omega, 2), 1, B)
+        for _ in 1:model.n_interp_steps
+            omega4 = spectral_upsample_2x(omega4)
+        end
+        omega = reshape(omega4, size(omega4, 1), size(omega4, 2), B)
+    end
     return omega, (fc=st_fc, blocks=st_bl, final_conv=st_fn)
 end
 

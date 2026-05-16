@@ -59,7 +59,7 @@ using Random
     @testset "UpsamplerWithFNO with ConvDecoder" begin
         latent_dim = 10
         upsampler, ps_up, st_up = ConvDecoder(
-            latent_dim, [32], 4, 2, [4, 2], 2, 3, gelu, :none, 4, N, rng, Float32)
+            latent_dim, [32], 4, 2, [4, 2], 2, 3, gelu, :none, 4, N, N, rng, Float32)
         n_fno_steps = 2
 
         combined, ps, st = UpsamplerWithFNO(
@@ -74,7 +74,7 @@ using Random
     @testset "eval_decoder_vel shape" begin
         latent_dim = 10
         upsampler, ps_up, st_up = ConvDecoder(
-            latent_dim, [32], 4, 2, [4, 2], 2, 3, gelu, :none, 4, N, rng, Float32)
+            latent_dim, [32], 4, 2, [4, 2], 2, 3, gelu, :none, 4, N, N, rng, Float32)
         combined, ps, st = UpsamplerWithFNO(
             upsampler, ps_up, st_up, N, n_modes, channels, n_layers, 1, rng)
 
