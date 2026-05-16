@@ -45,20 +45,28 @@ The convolutional upsampling model architecture. FC layers map the latent vector
 _Avoid_: conv decoder, upsampling decoder
 
 **Physics Refinement**:
-The second stage of the generative model. A dynamical process that advances the upsampling model's output forward in time, projecting it toward the system's attractor. The first implementation is relaxation via the KF solver; future implementations may use neural operators.
-_Avoid_: fine-tuning, post-processing, correction step
+The second stage of the generative model. A learned dynamical process that iteratively refines the upsampling model's output, projecting it toward the system's attractor. Implemented as a **Neural Operator** applied autoregressively for `n_fno_steps` iterations. The KF solver is not used in phase 2.
+_Avoid_: fine-tuning, post-processing, correction step, relaxation, solver rollout
 
-**Relaxation**:
-The KF-solver-based implementation of physics refinement. The upsampling model output is converted to spectral space and integrated by the KF solver for `T_relax` physical time units (with timestep `dt_relax`), then converted back to physical space. The solver's dynamics decay transients introduced by the upsampling model and pull the field toward the attractor.
-_Avoid_: solver rollout, fine-tuning, attractor projection
+**Neural Operator**:
+The FNO-based implementation of physics refinement. A Fourier Neural Operator (FNO) that maps a vorticity field (`N×N`) to a refined vorticity field (`N×N`) in a single forward pass. Applied autoregressively `n_fno_steps` times to the upsampling model output. Trained from scratch during phase 2 jointly with the upsampling model via a single end-to-end SWD loss. Hyperparameters: `n_modes` (spectral truncation, default = `num_freq`), `n_fno_layers` (depth, default = 4), `fno_channels` (hidden width, default = 32).
+_Avoid_: relaxation, solver surrogate, dynamics model
 
 **Spectral Upsampling Block**:
 One stage of the `ConvDecoder`. Doubles spatial resolution via spectral interpolation (FFT zero-pad → IFFT), applies `n_convs_per_block` circular-padded convolutions at constant channel width, adds the upsampled input as a skip connection, then reduces channels via a 1×1 convolution.
 _Avoid_: upsampling layer, decoder block
 
 **Latent Vector**:
-The input to the generative model, drawn from (or optimized within) a Gaussian distribution. Denoted `x` in code.
+The input to the generative model. Denoted `z` in code. During training, drawn via the reparameterization trick from the **per-snapshot posterior**: `z = mu + exp(log_sigma) * eps`, where `eps ~ N(0,I)` is generated in the training loop and passed explicitly into the loss function. At eval time, sampled fresh from N(0,I); the learned posteriors are not used.
 _Avoid_: latent code, latent variable, noise vector
+
+**Latent Posterior**:
+The per-snapshot variational distribution N(mu, exp(log_sigma)²) stored as two `latent_dim × n_train` parameter matrices: `ps.latent_mu` (initialized from N(0,I)) and `ps.latent_log_sigma` (initialized to 0, so sigma starts at 1). Both are jointly optimized with the upsampling model weights via Adam. Each column corresponds to one training snapshot; the batch loss indexes into them via `cols`. When `fix_latents_phase2` is true, both matrices are frozen together via `Optimisers.freeze!`.
+_Avoid_: latent matrix, latent embedding, latent table, encoder
+
+**KL Regularization**:
+A penalty added to the SWD loss that encourages the **latent posterior** to stay close to the prior N(0,I). Computed as `kl_weight * 0.5 * mean(sum(sigma² + mu² - 1 - 2*log_sigma, dims=1))` where `sigma = exp.(log_sigma)` and the sum is over the latent dimension. This is the standard KL from N(mu, sigma²) to N(0,I), averaged over the batch. Weight `kl_weight` is the beta scalar set in `train_ctrl.jl`.
+_Avoid_: KL divergence loss, VAE regularization, latent regularization, L2 regularization
 
 **Spin-up**:
 An initial phase of KF solver integration (duration `T_spinup`) that is discarded to allow transients to decay before recording a trajectory.
@@ -83,9 +91,9 @@ _Avoid_: model save, snapshot, serialized model
 - The **sensor array** defines where velocity **observations** are taken from each snapshot
 - The **generative model** is a two-stage pipeline: **upsampling model** → **physics refinement**
 - The **upsampling model** (`VortFourierDecoder` or `ConvDecoder`) maps a **latent vector** to an approximate vorticity field
-- **Relaxation** (the current **physics refinement** implementation) runs the **KF solver** from the upsampling model output for `T_relax` time units to produce the final vorticity field
-- The **SWD loss** is always computed on the final output (after relaxation when enabled)
-- Training runs in two phases: phase 1 trains the **upsampling model** with SWD on its direct output; phase 2 (optional) trains through the **relaxation** step with SWD on the relaxed output
+- **Physics refinement** (the **neural operator**) applies the FNO autoregressively `n_fno_steps` times to the upsampling model output to produce the final vorticity field
+- The **SWD loss** is always computed on the final output (after physics refinement when enabled)
+- Training runs in two phases: phase 1 trains the **upsampling model** with SWD on its direct output; phase 2 (optional) trains the combined upsampling model + neural operator end-to-end with SWD on the refined output
 - **Eval SWD** tracks generalisation against the held-out eval snapshots in physical space
 - After each training phase, a **checkpoint** records weights, loss history, and configuration; phase 1 and phase 2 checkpoints live in separate directories
 
@@ -95,10 +103,10 @@ _Avoid_: model save, snapshot, serialized model
 > **Domain expert:** "Run the **KF solver** through **spin-up**, then record a **trajectory**. We sample **observations** from that **trajectory** and train the **generative model** against them."
 
 > **Dev:** "What does the **generative model** output?"
-> **Domain expert:** "A vorticity field — but it's two stages. The **upsampling model** produces a rough field from a **latent vector**, then **relaxation** runs the **KF solver** for a short time to push that field onto the attractor."
+> **Domain expert:** "A vorticity field — but it's two stages. The **upsampling model** produces a rough field from a **latent vector**, then the **neural operator** refines it autoregressively `n_fno_steps` times to push it toward the attractor."
 
-> **Dev:** "Why run the solver again if you already have training data from it?"
-> **Domain expert:** "The **upsampling model** can produce fields that are physically implausible — off the attractor. A short **relaxation** decays those transients cheaply. The SWD loss on the relaxed output teaches the upsampling model to produce better initial conditions."
+> **Dev:** "Why add a neural operator if you already have training data from the KF solver?"
+> **Domain expert:** "The **upsampling model** can produce fields that are physically implausible — off the attractor. The **neural operator** learns to refine those fields during phase-2 training. Unlike the KF solver, it's fully differentiable, so gradients flow end-to-end through both stages with a single SWD loss."
 
 > **Dev:** "How do we know the model is learning?"
-> **Domain expert:** "The **sliced Wasserstein distance** drops during training and the **eval SWD** against held-out snapshots should decrease too. After each phase, the **checkpoint** lets us regenerate plots and compare distributions before and after relaxation."
+> **Domain expert:** "The **sliced Wasserstein distance** drops during training and the **eval SWD** against held-out snapshots should decrease too. In phase 2 the eval runs the full pipeline — upsampling model then neural operator — so the metric reflects what the combined generative model produces."

@@ -56,7 +56,7 @@ function run_no_particles(step, rhs, omega_hat, dt, T_data, save_every, Re, n, N
 end
 
 function main()
-    Re         = 100
+    Re         = 40
     n          = 4
     N          = 128
     dt         = Float32(0.01)

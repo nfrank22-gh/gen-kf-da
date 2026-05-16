@@ -29,21 +29,39 @@ function sliced_wasserstein_adjoint(P::Array{Float32,2}, Q::Array{Float32,2}, th
     return (thetas_n' * G) ./ n_total     # (flat_dim, batch)
 end
 
-function loss_fn(model, NDOF, x, ps, st,
-    u_meas_trg, v_meas_trg, sensor_lin, thetas)
-  u, v, st = eval_decoder_vel(model, NDOF, x, ps, st)
+# cols: Int32 vector of 1-based column indices into ps.latent_mu / ps.latent_log_sigma.
+# eps: N(0,I) noise sample of shape (latent_dim, batch_size), generated in the training loop.
+# Samples z via the reparameterization trick, computes SWD + beta-VAE KL regularization.
+function loss_fn(model, NDOF, ps, st,
+    u_meas_trg, v_meas_trg, sensor_lin, thetas, cols, eps, kl_weight)
+  mu        = ps.latent_mu[:, cols]
+  log_sigma = ps.latent_log_sigma[:, cols]
+  sigma     = exp.(log_sigma)
+  z         = mu .+ sigma .* eps
+  u, v, st = eval_decoder_vel(model, NDOF, z, ps, st)
   u_meas = reshape(u, size(u, 1) * size(u, 2), :)[sensor_lin, :]
   v_meas = reshape(v, size(v, 1) * size(v, 2), :)[sensor_lin, :]
   P = vcat(u_meas, v_meas)
   Q = vcat(u_meas_trg, v_meas_trg)
-  return sliced_wasserstein(P, Q, thetas), st
+  swd = sliced_wasserstein(P, Q, thetas)
+  kl  = 0.5f0 * mean(sum(sigma.^2 .+ mu.^2 .- 1f0 .- 2f0 .* log_sigma, dims=1))
+  return swd + kl_weight * kl, st
 end
 
-function loss_fn_vort_state(model, N_out::Integer, x, ps, st,
-    omega_trg, thetas)
-  omega, st = eval_decoder_vort(model, N_out, x, ps, st)
+# cols: Int32 vector of 1-based column indices into ps.latent_mu / ps.latent_log_sigma.
+# eps: N(0,I) noise sample of shape (latent_dim, batch_size), generated in the training loop.
+# Samples z via the reparameterization trick, computes SWD + beta-VAE KL regularization.
+function loss_fn_vort_state(model, N_out::Integer, ps, st,
+    omega_trg, thetas, cols, eps, kl_weight)
+  mu        = ps.latent_mu[:, cols]
+  log_sigma = ps.latent_log_sigma[:, cols]
+  sigma     = exp.(log_sigma)
+  z         = mu .+ sigma .* eps
+  omega, st = eval_decoder_vort(model, N_out, z, ps, st)
   flat_dim = N_out * N_out
   P = reshape(omega,     flat_dim, size(omega, 3))
   Q = reshape(omega_trg, flat_dim, size(omega_trg, 3))
-  return sliced_wasserstein(P, Q, thetas), st
+  swd = sliced_wasserstein(P, Q, thetas)
+  kl  = 0.5f0 * mean(sum(sigma.^2 .+ mu.^2 .- 1f0 .- 2f0 .* log_sigma, dims=1))
+  return swd + kl_weight * kl, st
 end

@@ -35,10 +35,10 @@ src/
                          #   _decode_vort_hat is the private shared spectral primitive
       loss_fn.jl         # sliced_wasserstein (physical-space),
                          #   loss_fn, loss_fn_vort_state (both arch-agnostic)
-      relaxation.jl      # relax (batched KF solver rollout, n_steps × kf_step_batched);
-                         #   loss_fn_relaxation (decode → rfft → relax → irfft → SWD);
-                         #   _kf_step_batched uses explicit rfft/irfft dims so the batch
-                         #   dimension is not transformed
+      fno.jl             # FNOLayer (spectral channel-mix + bypass Conv + gelu);
+                         #   FourierNeuralOperator (lift → layers → project, residual skip);
+                         #   UpsamplerWithFNO (upsampler + FNO × n_fno_steps, phase-2 model);
+                         #   eval_decoder_vort / eval_decoder_vel dispatches for UpsamplerWithFNO
       data_pipeline.jl   # DataPipeline submodule: load_trajectory, split_trajectory,
                          #   make_sensor_array, batch_partition, extract_observations
                          #   (takes SpectralGrid), extract_vorticity_spectral
@@ -51,7 +51,7 @@ src/
                          #   sample_epoch! (returns CPU arrays), get_batch (returns x, thetas, cols)
       training_session.jl # TrainingSession: owns model, tstate, data, mode-specific closures,
                           #   BatchSampler, compiled eval; train!(session) is the training loop;
-                          #   training_mode = :relaxation enables phase-2 (KF solver relaxation)
+                          #   phase-2 uses UpsamplerWithFNO as model with VorticityMode or ObservationsMode
 scripts/
   gen_data.jl            # spin-up + integrate + save to data/particles/ or data/no_particles/
   train_ctrl.jl          # wiring script: configure hyperparameters → build TrainingSession →
@@ -96,16 +96,20 @@ test/
 | `plateau_patience` | 10 | Epochs without improvement before LR reduction |
 | `plateau_factor` | 0.5 | LR multiplier on plateau |
 | `plateau_min_lr` | 1e-6 | Minimum LR floor |
-| `fix_x` | true | Fix latent samples for entire training run |
+| `kl_weight` | 1e-3 | Weight on L2 latent regularization (KL to N(0,I)) |
 | `fix_thetas` | true | Fix SWD projection directions for entire training run |
 | `training_mode` | `:vorticity` | `:observations` (sparse velocity) or `:vorticity` (full spectral) |
-| `run_phase2` | false | Enable phase-2 relaxation training after phase 1 |
-| `T_relax` | 0.1 | Physical time to run KF solver per sample in phase 2 |
-| `dt_relax` | 0.01 | Solver timestep for relaxation (steps = round(T_relax/dt_relax)) |
+| `run_phase2` | false | Enable phase-2 neural operator finetuning after phase 1 |
+| `n_fno_steps` | 3 | Autoregressive FNO applications per sample in phase 2 |
+| `n_modes` | 8 | FNO spectral truncation (modes per x/y direction) |
+| `fno_channels` | 32 | FNO hidden channel width |
+| `n_fno_layers` | 4 | Number of FNO layers |
 | `n_epochs_phase2` | 50 | Training epochs for phase 2 |
 | `eval_every_phase2` | 10 | Eval SWD frequency for phase 2 |
-| `lr_phase2` | 1e-4 | Adam learning rate for phase 2 (fresh ReduceOnPlateau reset to this) |
-| `freeze_upsampler` | false | Freeze upsampler weights in phase 2 (no-op for KF-solver fine-tuner) |
+| `lr_phase2` | 1e-4 | Adam learning rate for phase 2 (trains both upsampler and FNO) |
+| `freeze_decoder_phase2` | false | If true, only FNO weights are updated in phase 2; upsampler is optimizer-frozen via `Optimisers.freeze!` (see ADR 0004) |
+| `fix_latents_phase2` | false | If true, latent matrix is frozen in phase 2 via `Optimisers.freeze!` |
+| `decoder_checkpoint_dir` | `nothing` | If set to a directory path, load decoder weights from that checkpoint and skip phase-1 training entirely; architecture hyperparameters must match |
 
 ## Key parameters (gen_data.jl `main()`)
 
@@ -125,7 +129,7 @@ test/
 The solver uses [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (XLA backend) rather than CUDA.jl directly. CUDA.jl is not a dependency.
 
 - GPU backend is selected in `gen_data.jl` and `train_ctrl.jl` via `Reactant.set_default_backend("cuda")`.
-- `KfRhs` is constructed on CPU in both scripts. In `gen_data.jl` it is passed directly to `@compile`, which embeds its array values as XLA constants in the compiled function. In phase-2 relaxation training, the CPU `KfRhs` is captured in the loss closure; Reactant embeds its values as constants the same way when tracing the Enzyme gradient.
+- `KfRhs` is constructed on CPU in `gen_data.jl` and passed directly to `@compile`, which embeds its array values as XLA constants in the compiled function. Phase-2 no longer uses the KF solver.
 - Step functions are compiled once with `@compile` before the integration loop; the compiled callables are passed into `integrate()`.
 - Saving uses `irfft(Array(omega_hat), N)` — an explicit device→CPU transfer every `save_every` steps.
 
@@ -137,7 +141,7 @@ The solver uses [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) (XLA back
 
 ## Training AD notes
 
-- **Enzyme cannot trace FFTW on CPU**: `loss_fn_vort_state` and `loss_fn_relaxation` (both call `irfft` / `rfft`) cannot be tested with AutoEnzyme on CPU. Forward-pass-only CPU tests are fine. Production `train_ctrl.jl` uses `AutoEnzyme()` with Reactant arrays where XLA handles FFTs natively.
+- **Enzyme cannot trace FFTW on CPU**: `loss_fn_vort_state` and FNO layers (both call `irfft` / `rfft`) cannot be tested with AutoEnzyme on CPU. Forward-pass-only CPU tests are fine. Production `train_ctrl.jl` uses `AutoEnzyme()` with Reactant arrays where XLA handles FFTs natively.
 - **Optimizer state excluded from checkpoints**: `save_checkpoint` saves `ps` and `st` only. Resuming from a checkpoint requires re-initializing the optimizer.
 - **Lux re-exports**: `AutoEnzyme` (from `ADTypes`) and `reactant_device` (from `MLDataDevices`) are not in their originating packages' public namespaces — use `Lux.AutoEnzyme()` and `Lux.reactant_device()`. Both are re-exported by `Lux`.
 

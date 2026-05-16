@@ -4,7 +4,7 @@ using JLD2
 using JSON3
 using Lux
 
-export save_checkpoint
+export save_checkpoint, load_checkpoint
 
 function save_checkpoint(dir, ps, st, train_losses, eval_swds, eval_epochs, config::Dict)
     mkpath(dir)
@@ -28,6 +28,11 @@ function save_checkpoint(dir, ps, st, train_losses, eval_swds, eval_epochs, conf
     open(joinpath(dir, "config.json"), "w") do io
         JSON3.write(io, serializable)
     end
+end
+
+function load_checkpoint(dir)
+    d = load(joinpath(dir, "weights.jld2"))
+    return d["ps"], d["st"]
 end
 
 end
