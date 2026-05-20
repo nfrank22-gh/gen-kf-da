@@ -4,12 +4,13 @@ using CairoMakie
 using FFTW
 using Statistics
 
-export plot_train_loss_curve, plot_eval_swd_curve, plot_vorticity_panel, plot_energy_spectrum
+export plot_train_loss_curve, plot_eval_swd_curve, plot_vorticity_panel, plot_energy_spectrum,
+       plot_conditioned_panel, plot_da_point_estimate
 
 function plot_train_loss_curve(train_losses::AbstractVector, model_dir::AbstractString)
     mkpath(model_dir)
     fig = Figure()
-    ax  = Axis(fig[1, 1]; xlabel="Epoch", ylabel="Loss", title="Training Loss")
+    ax  = Axis(fig[1, 1]; xlabel="Epoch", ylabel="Loss", title="Training Loss", yscale=log10)
     lines!(ax, eachindex(train_losses), train_losses)
     save(joinpath(model_dir, "loss_curve.png"), fig)
 end
@@ -74,6 +75,57 @@ function plot_energy_spectrum(gen_omega_hat::AbstractArray{<:Complex, 3},
     lines!(ax, k_gt,  s_gt;  label="Ground truth")
     axislegend(ax)
     save(joinpath(model_dir, "energy_spectrum.png"), fig)
+end
+
+function plot_conditioned_panel(
+    gen_omega::AbstractArray{<:Real, 3},
+    gt_omega::AbstractArray{<:Real, 2},
+    sensor_ci::AbstractVector{<:CartesianIndex{2}},
+    model_dir::AbstractString,
+)
+    mkpath(model_dir)
+    n        = size(gen_omega, 3)
+    sensor_x = Float32[ci[1] for ci in sensor_ci]
+    sensor_y = Float32[ci[2] for ci in sensor_ci]
+    fig      = Figure(size = (n * 200, 420))
+
+    for i in 1:n
+        ax  = Axis(fig[1, i]; title = "Conditioned $i", xlabel = "x", ylabel = "y", aspect = DataAspect())
+        lim = max(maximum(abs, gen_omega[:, :, i]), eps(Float32))
+        heatmap!(ax, gen_omega[:, :, i]; colormap = :RdBu, colorrange = (-lim, lim))
+        scatter!(ax, sensor_x, sensor_y; color = :black, markersize = 4)
+    end
+
+    ax_gt  = Axis(fig[2, 1]; title = "Ground truth", xlabel = "x", ylabel = "y", aspect = DataAspect())
+    lim_gt = max(maximum(abs, gt_omega), eps(Float32))
+    heatmap!(ax_gt, gt_omega; colormap = :RdBu, colorrange = (-lim_gt, lim_gt))
+    scatter!(ax_gt, sensor_x, sensor_y; color = :black, markersize = 4)
+
+    save(joinpath(model_dir, "conditioned_vorticity.png"), fig)
+end
+
+function plot_da_point_estimate(
+    est_omega::AbstractMatrix{<:Real},
+    gt_omega::AbstractMatrix{<:Real},
+    sensor_ci::AbstractVector{<:CartesianIndex{2}},
+    out_dir::AbstractString,
+)
+    mkpath(out_dir)
+    sensor_x = Float32[ci[1] for ci in sensor_ci]
+    sensor_y = Float32[ci[2] for ci in sensor_ci]
+    fig = Figure(size = (400, 210))
+
+    ax_est = Axis(fig[1, 1]; title = "Point estimate", xlabel = "x", ylabel = "y", aspect = DataAspect())
+    lim_est = max(maximum(abs, est_omega), eps(Float32))
+    heatmap!(ax_est, est_omega; colormap = :RdBu, colorrange = (-lim_est, lim_est))
+    scatter!(ax_est, sensor_x, sensor_y; color = :black, markersize = 4)
+
+    ax_gt = Axis(fig[1, 2]; title = "Ground truth", xlabel = "x", ylabel = "y", aspect = DataAspect())
+    lim_gt = max(maximum(abs, gt_omega), eps(Float32))
+    heatmap!(ax_gt, gt_omega; colormap = :RdBu, colorrange = (-lim_gt, lim_gt))
+    scatter!(ax_gt, sensor_x, sensor_y; color = :black, markersize = 4)
+
+    save(joinpath(out_dir, "da_point_estimate.png"), fig)
 end
 
 end

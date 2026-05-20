@@ -4,7 +4,7 @@ using Lux
 using Random
 
 function make_test_inputs(rng)
-    model, ps, st = VortFourierDecoder([4, 8, 16], 4, rng)
+    model, ps, st = StreamFourierDecoder([4, 8, 16], 4, rng)
     train_losses = Float32[0.5, 0.4, 0.3]
     eval_swds    = Float32[0.2, 0.1]
     eval_epochs  = [1, 2]

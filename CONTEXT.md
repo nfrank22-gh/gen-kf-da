@@ -13,7 +13,7 @@ A time sequence of vorticity snapshots produced by the KF solver. The primary ou
 _Avoid_: rollout, flow snapshot sequence, ground-truth field
 
 **Vorticity**:
-The curl of the velocity field; the primary variable of the KF solver. Stored in spectral space as Fourier coefficients (`omega_hat`) and in physical space as a real array (`omega`). Velocity `(u, v)` is derived from vorticity via the stream function.
+The curl of the velocity field; the primary variable of the KF solver. Stored in spectral space as Fourier coefficients (`omega_hat`) and in physical space as a real array (`omega`). Velocity `(u, v)` is derived from vorticity via the stream function. Within the generative model, vorticity is a *derived* quantity computed from the model's stream function output via `ω̂ = |k|²·ψ̂`; it is not produced directly.
 _Avoid_: flow state, flow field
 
 **Observation**:
@@ -29,44 +29,61 @@ The time cutoff `T_train` applied to a trajectory; only snapshots up to `T_train
 _Avoid_: training split, train/test split
 
 **Generative Model**:
-The full two-stage pipeline that maps a latent vector to a physical-space vorticity field: an upsampling model followed by optional physics refinement. The SWD loss is always computed on the final output (after physics refinement if enabled).
+The neural network that maps a latent vector to a divergence-free physical-space velocity field `(u, v)`. Implemented as an **upsampling model** (`StreamFourierDecoder` or `ConvDecoder`). Velocity and vorticity are derived from the model's **stream function** output analytically in spectral space.
 _Avoid_: decoder, prior, surrogate model
 
 **Upsampling Model**:
-The first stage of the generative model. A neural network that maps a latent vector to an approximate vorticity field (N×N). Two architectures are available: `VortFourierDecoder` and `ConvDecoder`. The output may lie off the system's attractor; physics refinement corrects this.
-_Avoid_: decoder, generative model (use that term for the full pipeline)
+The neural network at the core of the generative model. Maps a latent vector to a **stream function** `ψ` at `N×N` resolution; divergence-free velocity `(u, v)` is derived from `ψ` analytically in spectral space (`û = iky·ψ̂`, `v̂ = -ikx·ψ̂`). Two architectures are available: `StreamFourierDecoder` and `ConvDecoder`.
+_Avoid_: decoder, generative model
 
-**VortFourierDecoder**:
-The MLP-based upsampling model architecture. An MLP maps the latent vector to Fourier coefficients, which are spectrally padded to the target resolution and inverse-FFT'd to physical space.
-_Avoid_: Fourier decoder, spectral decoder
+**StreamFourierDecoder**:
+The MLP-based upsampling model architecture. An MLP maps the latent vector to free Fourier coefficients `ψ̂` of the stream function (scalar, DC mode zeroed), which are spectrally padded to the target resolution. Velocity and vorticity are derived analytically: `û = iky·ψ̂`, `v̂ = -ikx·ψ̂`, `ω̂ = |k|²·ψ̂`. Incompressibility is guaranteed by construction with no projection step.
+_Avoid_: Fourier decoder, spectral decoder, VelFourierDecoder, VortFourierDecoder
 
 **ConvDecoder**:
-The convolutional upsampling model architecture. FC layers map the latent vector to a small spatial feature map, which is progressively upsampled to `N_conv×N_conv` via a series of spectral upsampling blocks, then collapsed to a 1-channel vorticity field by a final convolution. If `N_conv < N`, a final Fourier interpolation step (repeated spectral 2× upsampling) brings the output to the full `N×N` training resolution. `N / N_conv` must be a power of 2. When `N_conv = N` no interpolation step is applied and the behaviour is identical to the original architecture.
-_Avoid_: conv decoder, upsampling decoder
+The conv-based upsampling model architecture. A **Fourier Base** FC maps `z` to re+im Fourier coefficients of `C` channels at a `(k_base+1)×(2·k_base)` rfft spectrum; `irfft` gives a `(2·k_base)×(2·k_base)×C` physical feature map. A cascade of `B` **UpsampleBlocks** doubles resolution at each step until `N_conv×N_conv` is reached (`2·k_base·2^B = N_conv`). A two-conv tail (`tail_conv1 → act → tail_conv2`) collapses to the single-channel stream function `ψ`. If `N_conv < N`, iterated `spectral_upsample_2x` steps bring `ψ` to `N×N`. Velocity and vorticity are derived analytically from `ψ̂`. Per-block kernel sizes set via `kernel_sizes::Vector{Int}` (length `B`); tail kernel is a separate scalar `tail_kernel`.
+_Avoid_: FiLM decoder, FourierFiLMDecoder
 
-**Physics Refinement**:
-The second stage of the generative model. A learned dynamical process that iteratively refines the upsampling model's output, projecting it toward the system's attractor. Implemented as a **Neural Operator** applied autoregressively for `n_fno_steps` iterations. The KF solver is not used in phase 2.
-_Avoid_: fine-tuning, post-processing, correction step, relaxation, solver rollout
+**UpsampleBlock**:
+One stage of `ConvDecoder`. Structure: (1) `spectral_upsample_2x` doubles spatial resolution to `C_in` channels. (2) DenseNet dense block: `n_convs-1` plain layers, each `CircConv(j·C_in → C_in) → InstanceNorm → act → cat`, growing the running tensor to `n_convs·C_in` channels. (3) `CircConv(n_convs·C_in → n_convs·C_in) → InstanceNorm → act` — no additive skip; gradient flow is through the dense concatenation paths. (4) A 1×1 projection conv maps `n_convs·C_in → C_out`. Edge case: `n_convs=1` — zero dense layers; main conv receives `C_in` channels directly.
+_Avoid_: upsampling block, conv block, FiLM block
 
-**Neural Operator**:
-The FNO-based implementation of physics refinement. A Fourier Neural Operator (FNO) that maps a vorticity field (`N×N`) to a refined vorticity field (`N×N`) in a single forward pass. Applied autoregressively `n_fno_steps` times to the upsampling model output. Trained from scratch during phase 2 jointly with the upsampling model via a single end-to-end SWD loss. Hyperparameters: `n_modes` (spectral truncation, default = `num_freq`), `n_fno_layers` (depth, default = 4), `fno_channels` (hidden width, default = 32).
-_Avoid_: relaxation, solver surrogate, dynamics model
-
-**Spectral Upsampling Block**:
-One stage of the `ConvDecoder`. Doubles spatial resolution via spectral interpolation (FFT zero-pad → IFFT), applies `n_convs_per_block` circular-padded convolutions at constant channel width, adds the upsampled input as a skip connection, then reduces channels via a 1×1 convolution.
-_Avoid_: upsampling layer, decoder block
+**Stream Function**:
+The scalar field `ψ` from which the velocity field is derived: `u = ∂ψ/∂y`, `v = -∂ψ/∂x`. In spectral space: `û = iky·ψ̂`, `v̂ = -ikx·ψ̂`, `ω̂ = |k|²·ψ̂`. Guarantees ∇·u = 0 by construction — no Leray projection is needed. The DC mode `ψ̂(0,0)` is zeroed (it has no effect on `u`, `v`, or `ω` but would waste a learnable degree of freedom). The native output representation of all upsampling model architectures.
+_Avoid_: stream field, velocity potential, scalar potential
 
 **Latent Vector**:
 The input to the generative model. Denoted `z` in code. During training, drawn via the reparameterization trick from the **per-snapshot posterior**: `z = mu + exp(log_sigma) * eps`, where `eps ~ N(0,I)` is generated in the training loop and passed explicitly into the loss function. At eval time, sampled fresh from N(0,I); the learned posteriors are not used.
 _Avoid_: latent code, latent variable, noise vector
 
 **Latent Posterior**:
-The per-snapshot variational distribution N(mu, exp(log_sigma)²) stored as two `latent_dim × n_train` parameter matrices: `ps.latent_mu` (initialized from N(0,I)) and `ps.latent_log_sigma` (initialized to 0, so sigma starts at 1). Both are jointly optimized with the upsampling model weights via Adam. Each column corresponds to one training snapshot; the batch loss indexes into them via `cols`. When `fix_latents_phase2` is true, both matrices are frozen together via `Optimisers.freeze!`.
-_Avoid_: latent matrix, latent embedding, latent table, encoder
+The per-snapshot variational distribution N(mu, exp(log_sigma)²) from which the **latent vector** is drawn via the reparameterization trick during training. In `VorticityMode`, stored as two `latent_dim × n_train` parameter matrices `ps.latent_mu` and `ps.latent_log_sigma`, jointly optimized with the upsampling model weights via Adam; each column corresponds to one training snapshot and the batch loss indexes into them via `cols`. In `ObservationsMode`, mu and log_sigma are produced by the **Observation Encoder** forward pass on the batch's observations — no parameter table is stored.
+_Avoid_: latent matrix, latent embedding, latent table
+
+**Observation Encoder**:
+A DeepSets neural network that maps a batch of velocity observations to the parameters of the **Latent Posterior**: `mu` and `log_sigma` of shape `(latent_dim, batch_size)`. Each observation is represented as a 6-dim tuple `(u_i, v_i, sin(x_i), cos(x_i), sin(y_i), cos(y_i))` — the Fourier position features encode the 2π-periodic spatial topology. A shared sub-MLP (widths `encoder_hidden`) embeds each per-sensor tuple; mean pooling aggregates across sensors; a head MLP (widths `encoder_head_hidden`) maps the pooled embedding to `2·latent_dim` outputs split into mu and log_sigma. Used in `ObservationsMode` (fixed and random sensors) in place of per-snapshot **Latent Posterior** parameter tables. The encoder and **Upsampling Model** are jointly wrapped in an `ObservationEncoderDecoder` Lux container trained end-to-end.
+_Avoid_: amortized encoder, VAE encoder, inference network
+
+**Conditioned Posterior**:
+A per-snapshot latent posterior N(mu, exp(log_sigma)²) obtained by freezing the generative model weights and optimizing a fresh `(mu, log_sigma)` pair against the SWD loss on velocity **observations** from a single snapshot, plus **KL Regularization**. Initialized from N(0,I) / 0 and optimized via Adam with AutoEnzyme on GPU. Drawing samples from the conditioned posterior yields plausible flow states consistent with sparse observations.
+_Avoid_: posterior inference, amortized posterior
+
+**Snapshot DA**:
+A data assimilation experiment that conditions the **generative model** on velocity **observations** from a single eval-set snapshot: freeze the model weights, optimize a fresh **Conditioned Posterior** `(mu, log_sigma)` via Adam + SWD + **KL Regularization**, then draw samples and plot. Contrasts with sequential DA, which assimilates observations across many time steps. Implemented in `scripts/snapshot_DA.jl`; output written to `<checkpoint_dir>/snapshot_da/snap_{idx}/`.
+_Avoid_: single-step DA, instantaneous DA, static DA
 
 **KL Regularization**:
-A penalty added to the SWD loss that encourages the **latent posterior** to stay close to the prior N(0,I). Computed as `kl_weight * 0.5 * mean(sum(sigma² + mu² - 1 - 2*log_sigma, dims=1))` where `sigma = exp.(log_sigma)` and the sum is over the latent dimension. This is the standard KL from N(mu, sigma²) to N(0,I), averaged over the batch. Weight `kl_weight` is the beta scalar set in `train_ctrl.jl`.
+A penalty added to the SWD loss that encourages the **latent posterior** to stay close to the prior N(0,I). Computed as `kl_weight * 0.5 * mean(mean(sigma² + mu² - 1 - 2*log_sigma, dims=1))` where `sigma = exp.(log_sigma)`, the inner mean is over the latent dimension, and the outer mean is over the batch. Using `mean` (not `sum`) over the latent dimension makes `kl_weight` invariant to `latent_dim` — doubling `latent_dim` does not change the scale of the penalty. `kl_weight` is set in `train_ctrl.jl` and applied at full strength from epoch 1.
 _Avoid_: KL divergence loss, VAE regularization, latent regularization, L2 regularization
+
+
+**Latent LR Multiplier**:
+A scalar (default 10) by which the learning rate for the latent variational parameters — `latent_mu`, `latent_log_sigma` — exceeds the global decoder learning rate. Applied by setting a higher `eta` on those subtrees of the Optimisers.jl state tree after optimizer setup, and re-applied after every LR scheduler step to preserve the ratio as the global LR decays. Compensates for the sparse gradient signal each per-snapshot column receives relative to the shared decoder weights. Applies only in `VorticityMode`; in `ObservationsMode` the **Observation Encoder** replaces the per-snapshot parameter tables so no LR multiplier is needed.
+_Avoid_: per-parameter LR, parameter group LR
+
+**Symmetry Reduction**:
+A preprocessing step applied to every vorticity snapshot immediately after loading the trajectory, before the train/eval split. Maps each snapshot to its canonical representative in the quotient space by eliminating: (1) the 8-fold discrete shift-reflect symmetry S (y-shift by π/n + sign flip) using the method-of-symmetry-charting — sector = floor(arg(ω̂(0,1)) / (π/n)), correction S^k with k = (n−1)·sector mod 2n applied in physical space; (2) the 2-fold rotation symmetry R (spatial rotation by π = complex conjugation of ω̂) by checking sign of imag(ω̂(0,n)); (3) the continuous streamwise (x) translation symmetry via the first Fourier mode method of slices — aligning ω̂(1,0) to the positive real axis. Implemented as `reduce_symmetries` / `reduce_trajectory` in `DataPipeline`. Replaces the learned **Periodic Translation Parameters** approach; the model now outputs in the reduced space and no shift correction is needed at eval time.
+_Avoid_: symmetry augmentation, symmetry equivariance, data normalisation
 
 **Spin-up**:
 An initial phase of KF solver integration (duration `T_spinup`) that is discarded to allow transients to decay before recording a trajectory.
@@ -81,7 +98,7 @@ The physical-space sliced Wasserstein distance computed every `eval_every` epoch
 _Avoid_: validation loss, test loss
 
 **Checkpoint**:
-The saved model artefacts after a training phase. Phase 1 (upsampling model) writes to `<traj_dir>/model/`; phase 2 (physics refinement) writes to `<traj_dir>/model/phase2/`. Each checkpoint contains: `weights.jld2` (parameters and state), `train_log.jld2` (loss history), `config.json` (hyperparameters and sensor locations). Optimizer state is deliberately excluded.
+The saved model artefacts written to `<traj_dir>/model/` after training. Contains: `weights.jld2` (parameters and state), `train_log.jld2` (loss history), `config.json` (hyperparameters and sensor locations). Optimizer state is deliberately excluded.
 _Avoid_: model save, snapshot, serialized model
 
 ## Relationships
@@ -89,13 +106,10 @@ _Avoid_: model save, snapshot, serialized model
 - The **KF solver** produces a **trajectory** (after **spin-up**)
 - A **trajectory** is split at the **training horizon**: snapshots before it are training data, snapshots after are eval data
 - The **sensor array** defines where velocity **observations** are taken from each snapshot
-- The **generative model** is a two-stage pipeline: **upsampling model** → **physics refinement**
-- The **upsampling model** (`VortFourierDecoder` or `ConvDecoder`) maps a **latent vector** to an approximate vorticity field
-- **Physics refinement** (the **neural operator**) applies the FNO autoregressively `n_fno_steps` times to the upsampling model output to produce the final vorticity field
-- The **SWD loss** is always computed on the final output (after physics refinement when enabled)
-- Training runs in two phases: phase 1 trains the **upsampling model** with SWD on its direct output; phase 2 (optional) trains the combined upsampling model + neural operator end-to-end with SWD on the refined output
+- The **generative model** is the **upsampling model** (`StreamFourierDecoder` or `ConvDecoder`): it maps a **latent vector** to a **stream function** `ψ`; divergence-free `(u, v)` and vorticity are derived analytically from `ψ̂` in spectral space
+- The **SWD loss** is computed on `(u, v)` output derived from `ψ`; vorticity is derived from `ψ̂` when needed for **VorticityMode** or diagnostic plots
 - **Eval SWD** tracks generalisation against the held-out eval snapshots in physical space
-- After each training phase, a **checkpoint** records weights, loss history, and configuration; phase 1 and phase 2 checkpoints live in separate directories
+- After training, a **checkpoint** records weights, loss history, and configuration
 
 ## Example dialogue
 
@@ -103,10 +117,7 @@ _Avoid_: model save, snapshot, serialized model
 > **Domain expert:** "Run the **KF solver** through **spin-up**, then record a **trajectory**. We sample **observations** from that **trajectory** and train the **generative model** against them."
 
 > **Dev:** "What does the **generative model** output?"
-> **Domain expert:** "A vorticity field — but it's two stages. The **upsampling model** produces a rough field from a **latent vector**, then the **neural operator** refines it autoregressively `n_fno_steps` times to push it toward the attractor."
-
-> **Dev:** "Why add a neural operator if you already have training data from the KF solver?"
-> **Domain expert:** "The **upsampling model** can produce fields that are physically implausible — off the attractor. The **neural operator** learns to refine those fields during phase-2 training. Unlike the KF solver, it's fully differentiable, so gradients flow end-to-end through both stages with a single SWD loss."
+> **Domain expert:** "A divergence-free velocity field. The **upsampling model** produces a **stream function** `ψ` from a **latent vector**; velocity `(u, v)` and vorticity are derived from `ψ` analytically in spectral space."
 
 > **Dev:** "How do we know the model is learning?"
 > **Domain expert:** "The **sliced Wasserstein distance** drops during training and the **eval SWD** against held-out snapshots should decrease too. In phase 2 the eval runs the full pipeline — upsampling model then neural operator — so the metric reflects what the combined generative model produces."
