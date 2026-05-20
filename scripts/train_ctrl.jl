@@ -16,25 +16,33 @@ function main()
     # ── Sensor array (observations mode only) ─────────────────────────────────
     # random_sensors = true: one unique layout per training snapshot, fixed for the run.
     # random_sensors = false: one shared layout for all snapshots.
-    random_sensors = true
+    random_sensors = false
     n_meas_space  = 500          # only used when training_mode == :observations
     batch_size    = 801
     n_epochs      = 500
     eval_every    = 100
-    latent_dim    = 50
+    latent_dim    = 200
     n_slices      = 5000
-    lr                    = 5f-2
+    lr                    = 1f-2
     # :reduce_on_plateau, :cosine_annealing, :cosine_annealing_warm_restarts, or :none
-    lr_scheduler          = :cosine_annealing_warm_restarts
+    lr_scheduler          = :cosine_annealing
     plateau_patience      = 20
     plateau_factor        = 0.5f0
     plateau_min_lr        = 1f-6
-    cosine_T_max          = 250
-    cosine_eta_min        = 1f-5
+    cosine_T_max          = 500
+    cosine_eta_min        = 1f-4
     cosine_T_mult         = 1         # cycle length multiplier for warm restarts (ignored otherwise)
     fix_thetas            = false
-    kl_weight             = Float32(0.0) # beta-VAE weight on KL(N(mu,sigma²) || N(0,I))
-    latent_lr_multiplier  = Float32(1)         # LR multiplier for latent variational parameters
+    kl_weight             = Float32(0.000) # beta-VAE weight on KL(N(mu,sigma²) || N(0,I))
+    latent_lr_multiplier  = Float32(1)   # LR multiplier for latent tables (VorticityMode only)
+    # ── Observation encoder (ObservationsMode only) ───────────────────────────
+    # true  → amortised DeepSets encoder maps observations → (mu, log_sigma)
+    # false → per-snapshot (mu, log_sigma) tables optimised directly via Adam
+    use_encoder         = false
+    # DeepSets sub-MLP hidden widths (6 → encoder_hidden → pooled embedding).
+    encoder_hidden      = [128, 256]
+    # Head MLP hidden widths (encoder_hidden[end] → encoder_head_hidden → 2·latent_dim).
+    encoder_head_hidden = [128]
     # :observations — sparse velocity at sensor locations (production)
     # :vorticity    — full spectral vorticity fields (testing simplification)
     training_mode = :observations
@@ -58,17 +66,26 @@ function main()
         fc_hidden         = [256]         # hidden layers for FC latent → Fourier coefficients
         k_base            = 4             # wavenumber cutoff; irfft output is (2·k_base)×(2·k_base)
         init_channels     = 4            # C: initial channel count (Fourier base output)
-        conv_channels     = [32, 16, 8, 4]   # output channels per block (length = n_blocks)
+        conv_channels     = [16, 8, 4]   # output channels per block (length = n_blocks)
         n_convs_per_block = 2             # DenseNet convolutions per UpsampleBlock
-        kernel_sizes      = [3, 5, 7, 9]     # kernel size per block (length = n_blocks)
-        tail_kernel       = 9
+        kernel_sizes      = [3, 3, 3]     # kernel size per block (length = n_blocks)
+        tail_kernel       = 3
         # Constraint: 2·k_base·2^n_blocks == N_conv; N ÷ N_conv must be a power of 2.
         # k_base=4, n_blocks=3: 2·4·8 = 64 = N_conv for N=128 with one extra spectral upsample.
-    N_conv            = div(N, 1)
+    N_conv            = div(N, 2)
         model, ps, st = ConvDecoder(latent_dim, fc_hidden, k_base, init_channels,
                                     conv_channels, n_convs_per_block, kernel_sizes, tail_kernel,
                                     act, N_conv, N, rng, T)
     
+    end
+
+    # ── Wrap decoder with encoder for observations mode ───────────────────────
+    if training_mode == :observations && use_encoder
+        encoder, enc_ps, enc_st = DeepSetsEncoder(encoder_hidden, encoder_head_hidden,
+                                                   latent_dim, rng, T)
+        model = ObservationEncoderDecoder(encoder, model)
+        ps    = (encoder=enc_ps, decoder=ps)
+        st    = (encoder=enc_st, decoder=st)
     end
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -97,15 +114,19 @@ function main()
     init_latent_log_sigma = Float32(-8)
     if resume_phase1
         println("Resuming: loading weights from $model_dir")
-        ps, st = load_checkpoint(model_dir)
-        init_latent_mu        = ps.latent_mu
-        init_latent_log_sigma = ps.latent_log_sigma
+        loaded_ps, loaded_st = load_checkpoint(model_dir)
+        ps = loaded_ps
+        st = loaded_st
+        if !(training_mode == :observations && use_encoder)
+            init_latent_mu        = ps.latent_mu
+            init_latent_log_sigma = ps.latent_log_sigma
+        end
     end
 
     mode = if training_mode == :observations
         ObservationsMode(train_snaps, N, batch_size, n_meas_space, sensor_ci;
                          random_sensors=random_sensors, rng=rng,
-                         recon_loss=recon_loss)
+                         recon_loss=recon_loss, use_encoder=use_encoder)
     else
         VorticityMode(train_snaps, N, batch_size; recon_loss=recon_loss)
     end
@@ -163,6 +184,11 @@ function main()
     end
     if training_mode == :observations
         config["sensor_locations"] = sensor_ci
+        config["use_encoder"]      = use_encoder
+        if use_encoder
+            config["encoder_hidden"]      = encoder_hidden
+            config["encoder_head_hidden"] = encoder_head_hidden
+        end
     end
     save_checkpoint(model_dir,
         session.tstate.parameters, session.tstate.states,
@@ -177,7 +203,7 @@ function main()
     ps_cpu = cpu(session.tstate.parameters)
     st_cpu = cpu(session.tstate.states)
 
-    x_plot = if vort_panel_use_optimized_latents
+    x_plot = if vort_panel_use_optimized_latents && !(model isa ObservationEncoderDecoder)
         idx = rand(rng, 1:session.n_train, n_plot)
         Array(ps_cpu.latent_mu[:, idx])
     else
@@ -188,13 +214,19 @@ function main()
     plot_vorticity_panel(gen_omega, gt_omega, model_dir)
 
     if model_arch == :fourier
+        # Unwrap to the StreamFourierDecoder for spectral diagnostics.
+        dec, dec_ps, dec_st = if model isa ObservationEncoderDecoder
+            model.decoder, ps_cpu.decoder, st_cpu.decoder
+        else
+            model, ps_cpu, st_cpu
+        end
         NDOF_model  = 2 * num_freq - 1
         nfreq_model = num_freq
         gt_oh_re, gt_oh_im = extract_vorticity_spectral(
             eval_snaps, collect(1:n_plot), nfreq_model, NDOF_model, N)
         gt_omega_hat  = complex.(gt_oh_re, gt_oh_im)
-        psi_hat, _ = NN._decode_psi_hat(model, x_plot, ps_cpu, st_cpu)
-        gen_omega_hat = .-model.grid.lap .* psi_hat   # |k|² · ψ̂
+        psi_hat, _ = NN._decode_psi_hat(dec, x_plot, dec_ps, dec_st)
+        gen_omega_hat = .-dec.grid.lap .* psi_hat   # |k|² · ψ̂
         plot_energy_spectrum(gen_omega_hat, gt_omega_hat, model_dir)
     end
 

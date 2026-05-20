@@ -1,8 +1,9 @@
 using Lux
 
-# Reconstruct the upsampling model from a saved config dict.
+# Reconstruct the model from a saved config dict.
 # Returns only the model; load ps and st separately from the checkpoint.
 # Activation is fixed to gelu — it is not serialised in config.json.
+# If the config contains encoder_hidden, returns an ObservationEncoderDecoder.
 function build_model_from_config(config::Dict, rng)
     T          = Float32
     N          = Int(config["N"])
@@ -12,10 +13,10 @@ function build_model_from_config(config::Dict, rng)
     if arch == :fourier
         num_freq = Int(config["num_freq"])
         layers   = Vector{Int}(config["layers"])
-        model, _, _ = StreamFourierDecoder(layers, num_freq, rng, T)
+        decoder, _, _ = StreamFourierDecoder(layers, num_freq, rng, T)
 
     elseif arch == :conv
-        model, _, _ = ConvDecoder(
+        decoder, _, _ = ConvDecoder(
             latent_dim,
             Vector{Int}(config["fc_hidden"]),
             Int(config["k_base"]),
@@ -31,5 +32,13 @@ function build_model_from_config(config::Dict, rng)
     else
         error("Unknown model_arch: $(config["model_arch"])")
     end
-    return model
+
+    if haskey(config, "encoder_hidden")
+        encoder_hidden      = Vector{Int}(config["encoder_hidden"])
+        encoder_head_hidden = Vector{Int}(config["encoder_head_hidden"])
+        encoder, _, _ = DeepSetsEncoder(encoder_hidden, encoder_head_hidden, latent_dim, rng, T)
+        return ObservationEncoderDecoder(encoder, decoder)
+    end
+
+    return decoder
 end

@@ -56,13 +56,18 @@ function TrainingSession(
     init_latent_mu::Union{Nothing,Matrix{Float32},Float32}        = nothing,
     init_latent_log_sigma::Union{Nothing,Matrix{Float32},Float32} = nothing,
 )
-    n_train          = size(train_snaps, 3)
-    latent_mu        = init_latent_mu        isa Float32 ? fill(init_latent_mu, latent_dim, n_train)  :
-                       init_latent_mu        !== nothing ? init_latent_mu        : randn(rng, Float32, latent_dim, n_train)
-    latent_log_sigma = init_latent_log_sigma isa Float32 ? fill(init_latent_log_sigma, latent_dim, n_train) :
-                       init_latent_log_sigma !== nothing ? init_latent_log_sigma : zeros(Float32, latent_dim, n_train)
-    ps = merge(ps, (latent_mu        = latent_mu,
-                    latent_log_sigma = latent_log_sigma))
+    n_train = size(train_snaps, 3)
+
+    # Latent posterior parameter tables are only used when the model does NOT have an
+    # amortised encoder. ObservationEncoderDecoder produces mu/log_sigma via forward pass.
+    if !(model isa ObservationEncoderDecoder)
+        latent_mu        = init_latent_mu        isa Float32 ? fill(init_latent_mu, latent_dim, n_train)  :
+                           init_latent_mu        !== nothing ? init_latent_mu        : randn(rng, Float32, latent_dim, n_train)
+        latent_log_sigma = init_latent_log_sigma isa Float32 ? fill(init_latent_log_sigma, latent_dim, n_train) :
+                           init_latent_log_sigma !== nothing ? init_latent_log_sigma : zeros(Float32, latent_dim, n_train)
+        ps = merge(ps, (latent_mu        = latent_mu,
+                        latent_log_sigma = latent_log_sigma))
+    end
 
     dev = Lux.reactant_device()
     ps  = ps |> dev
@@ -71,8 +76,10 @@ function TrainingSession(
     opt    = build_optimizer(lr)
     tstate = Training.TrainState(model, ps, st, opt)
 
-    # Apply latent LR multiplier to variational parameter subtrees from the start.
-    _adjust_latent_lr!(tstate.optimizer_state, lr * latent_lr_multiplier)
+    # Latent LR multiplier only applies to the per-snapshot parameter tables.
+    if !(model isa ObservationEncoderDecoder)
+        _adjust_latent_lr!(tstate.optimizer_state, lr * latent_lr_multiplier)
+    end
 
     lr_sched = if lr_scheduler == :reduce_on_plateau
         ReduceOnPlateau(lr; factor=plateau_factor, patience=plateau_patience, min_lr=plateau_min_lr)
@@ -141,13 +148,19 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
             if session.lr_sched !== nothing
                 new_lr = step!(session.lr_sched, epoch, avg_loss)
                 Optimisers.adjust!(session.tstate.optimizer_state, eta=new_lr)
-                _adjust_latent_lr!(session.tstate.optimizer_state, new_lr * cfg.latent_lr_multiplier)
+                if !(session.model isa ObservationEncoderDecoder)
+                    _adjust_latent_lr!(session.tstate.optimizer_state, new_lr * cfg.latent_lr_multiplier)
+                end
                 current_lr = new_lr
             else
                 current_lr = cfg.lr
             end
-            latent_lr = current_lr * cfg.latent_lr_multiplier
-            println("epoch $epoch  loss = $avg_loss  lr = $current_lr  latent_lr = $latent_lr")
+            if session.model isa ObservationEncoderDecoder
+                println("epoch $epoch  loss = $avg_loss  lr = $current_lr")
+            else
+                latent_lr = current_lr * cfg.latent_lr_multiplier
+                println("epoch $epoch  loss = $avg_loss  lr = $current_lr  latent_lr = $latent_lr")
+            end
         else
             println("epoch $epoch  (upsampler frozen — skipping gradient update)")
         end

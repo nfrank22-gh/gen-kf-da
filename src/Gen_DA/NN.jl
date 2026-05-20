@@ -2,7 +2,9 @@ module NN
 import ..SpectralGrid, ..spectral_pad, ..velocity_from_psi_hat, ..vorticity_from_vel
 export SpectralGrid, spectral_pad, velocity_from_psi_hat, vorticity_from_vel,
        StreamFourierDecoder, ConvDecoder, eval_decoder_vort, eval_decoder_vel,
-       loss_fn, loss_fn_vort_state, sliced_wasserstein, kl_regularization,
+       ObservationEncoderDecoder, DeepSetsEncoder, encode,
+       loss_fn, loss_fn_vort_state, loss_fn_encoder, loss_fn_encoder_per_sample,
+       sliced_wasserstein, kl_regularization,
        DataPipeline, Checkpoint, TrainingPlots, plot_conditioned_vorticity,
        build_optimizer, ReduceOnPlateau, step!,
        BatchSampler, sample_epoch!, get_batch,
@@ -11,6 +13,7 @@ export SpectralGrid, spectral_pad, velocity_from_psi_hat, vorticity_from_vel,
        build_model_from_config
 include("NN/model.jl")
 include("NN/conv_decoder.jl")
+include("NN/observation_encoder.jl")
 include("NN/loss_fn.jl")
 include("NN/data_pipeline.jl")
 include("NN/checkpoint.jl")

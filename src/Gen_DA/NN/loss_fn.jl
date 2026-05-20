@@ -65,6 +65,50 @@ function loss_fn_per_sample_sensors(model, N, ps, st,
   return rec + _total_kl(mu, log_sigma, kl_weight), st
 end
 
+# Loss for ObservationsMode with encoder (fixed sensor layout).
+# obs_features: (6, n_meas, B) — rows 1-2 are (u,v) targets; rows 3-6 are position features.
+# sensor_lin: constant Vector{Int} for gathering model-predicted (u,v) at sensor locations.
+function loss_fn_encoder(model, N, ps, st,
+    obs_features, sensor_lin, thetas, eps, kl_weight;
+    recon_loss::Symbol=:swd)
+  mu, log_sigma, st = encode(model, obs_features, ps, st)
+  z           = mu .+ exp.(log_sigma) .* eps
+  u, v, st    = eval_decoder_vel(model, N, z, ps, st)
+  u_meas      = reshape(u, size(u, 1) * size(u, 2), size(u, 3))[sensor_lin, :]
+  v_meas      = reshape(v, size(v, 1) * size(v, 2), size(v, 3))[sensor_lin, :]
+  u_trg       = obs_features[1, :, :]
+  v_trg       = obs_features[2, :, :]
+  P   = vcat(u_meas, v_meas)
+  Q   = vcat(u_trg,  v_trg)
+  rec = recon_loss == :mse ? mse_reconstruction(P, Q) : sliced_wasserstein(P, Q, thetas)
+  return rec + _total_kl(mu, log_sigma, kl_weight), st
+end
+
+# Loss for ObservationsMode with encoder and per-sample random sensor layouts.
+# obs_features: (6, n_meas, B) — rows 1-2 are (u,v) targets; rows 3-6 are position features.
+# sensor_lin_batch: (n_meas, B) Int32 matrix of linearised indices, one column per sample.
+function loss_fn_encoder_per_sample(model, N, ps, st,
+    obs_features, sensor_lin_batch, thetas, eps, kl_weight;
+    recon_loss::Symbol=:swd)
+  mu, log_sigma, st = encode(model, obs_features, ps, st)
+  z           = mu .+ exp.(log_sigma) .* eps
+  u, v, st    = eval_decoder_vel(model, N, z, ps, st)
+  N2          = Int32(N * N)
+  B           = size(u, 3)
+  u_flat      = reshape(u, N2, B)
+  v_flat      = reshape(v, N2, B)
+  col_offsets = reshape(Int32.(0:B-1), 1, B) .* N2
+  lin_idx     = sensor_lin_batch .+ col_offsets
+  u_meas      = u_flat[lin_idx]
+  v_meas      = v_flat[lin_idx]
+  u_trg       = obs_features[1, :, :]
+  v_trg       = obs_features[2, :, :]
+  P   = vcat(u_meas, v_meas)
+  Q   = vcat(u_trg,  v_trg)
+  rec = recon_loss == :mse ? mse_reconstruction(P, Q) : sliced_wasserstein(P, Q, thetas)
+  return rec + _total_kl(mu, log_sigma, kl_weight), st
+end
+
 function loss_fn_vort_state(model, N_out::Integer, ps, st,
     omega_trg, thetas, cols, eps, kl_weight;
     recon_loss::Symbol=:swd)
