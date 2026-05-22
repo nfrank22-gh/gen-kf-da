@@ -40,12 +40,16 @@ _Avoid_: decoder, generative model
 The MLP-based upsampling model architecture. An MLP maps the latent vector to free Fourier coefficients `ψ̂` of the stream function (scalar, DC mode zeroed), which are spectrally padded to the target resolution. Velocity and vorticity are derived analytically: `û = iky·ψ̂`, `v̂ = -ikx·ψ̂`, `ω̂ = |k|²·ψ̂`. Incompressibility is guaranteed by construction with no projection step.
 _Avoid_: Fourier decoder, spectral decoder, VelFourierDecoder, VortFourierDecoder
 
+**SpectralCircConv**:
+A hybrid conv layer used throughout `ConvDecoder` (replacing plain `CircConv` in all dense and main convs, and both tail convs). Each call runs two parallel branches and **sums** their outputs: (1) **Conv branch** — the existing `CircConv` with circular padding (captures local spatial structure). (2) **Spectral branch** — truncated FNO-style: `rfft` the input, apply a learned complex `(k_max, k_max, C_out, C_in)` channel-mixing matrix to the two corner regions of the 2D frequency grid (`[1:k_max, 1:k_max]` and `[1:k_max, W-k_max+1:W]`), zero-pad the rest, then `irfft` back to physical space (captures long-range/global structure via the lowest `k_max` modes). Complex weights are stored as split Float32 pairs `(W_lo_re, W_lo_im, W_hi_re, W_hi_im)` so all Lux parameters remain plain `Float32`. `k_max` is configured per-block via `spectral_modes::Vector{Int}` and separately for the tail via `tail_spectral_modes::Int`.
+_Avoid_: FNO layer, spectral conv, Fourier layer
+
 **ConvDecoder**:
-The conv-based upsampling model architecture. A **Fourier Base** FC maps `z` to re+im Fourier coefficients of `C` channels at a `(k_base+1)×(2·k_base)` rfft spectrum; `irfft` gives a `(2·k_base)×(2·k_base)×C` physical feature map. A cascade of `B` **UpsampleBlocks** doubles resolution at each step until `N_conv×N_conv` is reached (`2·k_base·2^B = N_conv`). A two-conv tail (`tail_conv1 → act → tail_conv2`) collapses to the single-channel stream function `ψ`. If `N_conv < N`, iterated `spectral_upsample_2x` steps bring `ψ` to `N×N`. Velocity and vorticity are derived analytically from `ψ̂`. Per-block kernel sizes set via `kernel_sizes::Vector{Int}` (length `B`); tail kernel is a separate scalar `tail_kernel`.
+The conv-based upsampling model architecture. A **Fourier Base** FC maps `z` to re+im Fourier coefficients of `C` channels at a `(k_base+1)×(2·k_base)` rfft spectrum; `irfft` gives a `(2·k_base)×(2·k_base)×C` physical feature map. A cascade of `B` **UpsampleBlocks** doubles resolution at each step until `N_conv×N_conv` is reached (`2·k_base·2^B = N_conv`). A two-**SpectralCircConv** tail (`tail_conv1 → act → tail_conv2`) collapses to the single-channel stream function `ψ`. If `N_conv < N`, iterated `spectral_upsample_2x` steps bring `ψ` to `N×N`. Velocity and vorticity are derived analytically from `ψ̂`. Per-block kernel sizes set via `kernel_sizes::Vector{Int}` (length `B`); FNO truncation modes set via `spectral_modes::Vector{Int}` (length `B`); tail scalars `tail_kernel` and `tail_spectral_modes`.
 _Avoid_: FiLM decoder, FourierFiLMDecoder
 
 **UpsampleBlock**:
-One stage of `ConvDecoder`. Structure: (1) `spectral_upsample_2x` doubles spatial resolution to `C_in` channels. (2) DenseNet dense block: `n_convs-1` plain layers, each `CircConv(j·C_in → C_in) → InstanceNorm → act → cat`, growing the running tensor to `n_convs·C_in` channels. (3) `CircConv(n_convs·C_in → n_convs·C_in) → InstanceNorm → act` — no additive skip; gradient flow is through the dense concatenation paths. (4) A 1×1 projection conv maps `n_convs·C_in → C_out`. Edge case: `n_convs=1` — zero dense layers; main conv receives `C_in` channels directly.
+One stage of `ConvDecoder`. Structure: (1) `spectral_upsample_2x` doubles spatial resolution to `C_in` channels. (2) DenseNet dense block: `n_convs-1` plain layers, each `SpectralCircConv(j·C_in → C_in) → InstanceNorm → act → cat`, growing the running tensor to `n_convs·C_in` channels. (3) `SpectralCircConv(n_convs·C_in → n_convs·C_in) → InstanceNorm → act` — no additive skip; gradient flow is through the dense concatenation paths. (4) A 1×1 projection conv maps `n_convs·C_in → C_out`. Edge case: `n_convs=1` — zero dense layers; main conv receives `C_in` channels directly. All `SpectralCircConv` layers in a block share the same `k_max` (from `spectral_modes[i]`).
 _Avoid_: upsampling block, conv block, FiLM block
 
 **Stream Function**:
@@ -57,12 +61,8 @@ The input to the generative model. Denoted `z` in code. During training, drawn v
 _Avoid_: latent code, latent variable, noise vector
 
 **Latent Posterior**:
-The per-snapshot variational distribution N(mu, exp(log_sigma)²) from which the **latent vector** is drawn via the reparameterization trick during training. In `VorticityMode`, stored as two `latent_dim × n_train` parameter matrices `ps.latent_mu` and `ps.latent_log_sigma`, jointly optimized with the upsampling model weights via Adam; each column corresponds to one training snapshot and the batch loss indexes into them via `cols`. In `ObservationsMode`, mu and log_sigma are produced by the **Observation Encoder** forward pass on the batch's observations — no parameter table is stored.
+The per-snapshot variational distribution N(mu, exp(log_sigma)²) from which the **latent vector** is drawn via the reparameterization trick during training. Stored as two `latent_dim × n_train` parameter matrices `ps.latent_mu` and `ps.latent_log_sigma`, jointly optimized with the upsampling model weights via Adam; each column corresponds to one training snapshot and the batch loss indexes into them via `cols`.
 _Avoid_: latent matrix, latent embedding, latent table
-
-**Observation Encoder**:
-A DeepSets neural network that maps a batch of velocity observations to the parameters of the **Latent Posterior**: `mu` and `log_sigma` of shape `(latent_dim, batch_size)`. Each observation is represented as a 6-dim tuple `(u_i, v_i, sin(x_i), cos(x_i), sin(y_i), cos(y_i))` — the Fourier position features encode the 2π-periodic spatial topology. A shared sub-MLP (widths `encoder_hidden`) embeds each per-sensor tuple; mean pooling aggregates across sensors; a head MLP (widths `encoder_head_hidden`) maps the pooled embedding to `2·latent_dim` outputs split into mu and log_sigma. Used in `ObservationsMode` (fixed and random sensors) in place of per-snapshot **Latent Posterior** parameter tables. The encoder and **Upsampling Model** are jointly wrapped in an `ObservationEncoderDecoder` Lux container trained end-to-end.
-_Avoid_: amortized encoder, VAE encoder, inference network
 
 **Conditioned Posterior**:
 A per-snapshot latent posterior N(mu, exp(log_sigma)²) obtained by freezing the generative model weights and optimizing a fresh `(mu, log_sigma)` pair against the SWD loss on velocity **observations** from a single snapshot, plus **KL Regularization**. Initialized from N(0,I) / 0 and optimized via Adam with AutoEnzyme on GPU. Drawing samples from the conditioned posterior yields plausible flow states consistent with sparse observations.
@@ -78,7 +78,7 @@ _Avoid_: KL divergence loss, VAE regularization, latent regularization, L2 regul
 
 
 **Latent LR Multiplier**:
-A scalar (default 10) by which the learning rate for the latent variational parameters — `latent_mu`, `latent_log_sigma` — exceeds the global decoder learning rate. Applied by setting a higher `eta` on those subtrees of the Optimisers.jl state tree after optimizer setup, and re-applied after every LR scheduler step to preserve the ratio as the global LR decays. Compensates for the sparse gradient signal each per-snapshot column receives relative to the shared decoder weights. Applies only in `VorticityMode`; in `ObservationsMode` the **Observation Encoder** replaces the per-snapshot parameter tables so no LR multiplier is needed.
+A scalar (default 10) by which the learning rate for the latent variational parameters — `latent_mu`, `latent_log_sigma` — exceeds the global decoder learning rate. Applied by setting a higher `eta` on those subtrees of the Optimisers.jl state tree after optimizer setup, and re-applied after every LR scheduler step to preserve the ratio as the global LR decays. Compensates for the sparse gradient signal each per-snapshot column receives relative to the shared decoder weights.
 _Avoid_: per-parameter LR, parameter group LR
 
 **Symmetry Reduction**:
@@ -90,11 +90,15 @@ An initial phase of KF solver integration (duration `T_spinup`) that is discarde
 _Avoid_: burn-in, equilibration, warm-up
 
 **Sliced Wasserstein Distance (SWD)**:
-The training and evaluation loss. Projects sample sets onto random unit directions and averages the 1-D Wasserstein distance. Always computed in physical space: either over flattened vorticity fields (`N×N`) or over velocity observations at sensor locations.
+A training and evaluation loss. Projects sample sets onto random unit directions and averages the 1-D Wasserstein distance. Always computed in physical space: either over flattened vorticity fields (`N×N`) or over velocity observations at sensor locations. Selected via `recon_loss = :swd`.
 _Avoid_: Wasserstein loss, Earth mover's distance, OT loss
 
+**Sinkhorn Divergence**:
+An alternative reconstruction loss to SWD. Computes the debiased entropic optimal transport divergence `S_ε(P,Q) = OT_ε(P,Q) − ½·OT_ε(P,P) − ½·OT_ε(Q,Q)` using squared L2 ground metric. The cost matrix is normalised by `mean(C_PQ)` before Sinkhorn iterations so that `sinkhorn_eps` is scale-invariant. Fixed iteration count (`sinkhorn_n_iter`, default 100) for XLA compatibility. Selected via `recon_loss = :sinkhorn`; configured via `sinkhorn_eps` and `sinkhorn_n_iter` in `train_ctrl.jl`. The **Eval SWD** metric remains SWD regardless of which reconstruction loss is used for training.
+_Avoid_: regularised OT, entropic OT, Sinkhorn loss
+
 **Eval SWD**:
-The physical-space sliced Wasserstein distance computed every `eval_every` epochs against held-out vorticity snapshots (flattened `N×N` arrays). Measures generalisation to unseen flow states without requiring observations.
+The physical-space sliced Wasserstein distance computed every `eval_every` epochs against held-out vorticity snapshots (flattened `N×N` arrays). Measures generalisation to unseen flow states without requiring observations. Always computed with SWD regardless of the training reconstruction loss.
 _Avoid_: validation loss, test loss
 
 **Checkpoint**:

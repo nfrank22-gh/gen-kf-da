@@ -58,16 +58,12 @@ function TrainingSession(
 )
     n_train = size(train_snaps, 3)
 
-    # Latent posterior parameter tables are only used when the model does NOT have an
-    # amortised encoder. ObservationEncoderDecoder produces mu/log_sigma via forward pass.
-    if !(model isa ObservationEncoderDecoder)
-        latent_mu        = init_latent_mu        isa Float32 ? fill(init_latent_mu, latent_dim, n_train)  :
-                           init_latent_mu        !== nothing ? init_latent_mu        : randn(rng, Float32, latent_dim, n_train)
-        latent_log_sigma = init_latent_log_sigma isa Float32 ? fill(init_latent_log_sigma, latent_dim, n_train) :
-                           init_latent_log_sigma !== nothing ? init_latent_log_sigma : zeros(Float32, latent_dim, n_train)
-        ps = merge(ps, (latent_mu        = latent_mu,
-                        latent_log_sigma = latent_log_sigma))
-    end
+    latent_mu        = init_latent_mu        isa Float32 ? fill(init_latent_mu, latent_dim, n_train)  :
+                       init_latent_mu        !== nothing ? init_latent_mu        : randn(rng, Float32, latent_dim, n_train)
+    latent_log_sigma = init_latent_log_sigma isa Float32 ? fill(init_latent_log_sigma, latent_dim, n_train) :
+                       init_latent_log_sigma !== nothing ? init_latent_log_sigma : zeros(Float32, latent_dim, n_train)
+    ps = merge(ps, (latent_mu        = latent_mu,
+                    latent_log_sigma = latent_log_sigma))
 
     dev = Lux.reactant_device()
     ps  = ps |> dev
@@ -76,10 +72,7 @@ function TrainingSession(
     opt    = build_optimizer(lr)
     tstate = Training.TrainState(model, ps, st, opt)
 
-    # Latent LR multiplier only applies to the per-snapshot parameter tables.
-    if !(model isa ObservationEncoderDecoder)
-        _adjust_latent_lr!(tstate.optimizer_state, lr * latent_lr_multiplier)
-    end
+    _adjust_latent_lr!(tstate.optimizer_state, lr * latent_lr_multiplier)
 
     lr_sched = if lr_scheduler == :reduce_on_plateau
         ReduceOnPlateau(lr; factor=plateau_factor, patience=plateau_patience, min_lr=plateau_min_lr)
@@ -129,17 +122,19 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
             data_all = mode.prepare_epoch(full_batches)
             sample_epoch!(session.sampler)
 
-            batch_losses = Vector{Any}(undef, mode.n_full)
+            batch_losses     = Vector{Any}(undef, mode.n_full)
+            sinkhorn_residuals = Vector{Any}(undef, mode.n_full)
             for i in 1:mode.n_full
                 thetas_batch, cols = get_batch(session.sampler, i)
                 thetas     = Reactant.to_rarray(thetas_batch)
                 cols_ra    = Reactant.to_rarray(collect(Int32, cols))
                 eps_ra     = Reactant.to_rarray(randn(session.rng, Float32, cfg.latent_dim, length(cols)))
                 data_batch = mode.get_data_batch(data_all, cols)
-                _, loss, _, session.tstate = Training.single_train_step!(
+                _, loss, aux, session.tstate = Training.single_train_step!(
                     Lux.AutoEnzyme(), mode.train_loss,
                     (data_batch..., thetas, cols_ra, eps_ra, kl_w_ra), session.tstate)
-                batch_losses[i] = loss
+                batch_losses[i]      = loss
+                sinkhorn_residuals[i] = get(aux, :sinkhorn_residual, nothing)
             end
 
             avg_loss = sum(Float32(l) for l in batch_losses) / mode.n_full
@@ -148,17 +143,16 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
             if session.lr_sched !== nothing
                 new_lr = step!(session.lr_sched, epoch, avg_loss)
                 Optimisers.adjust!(session.tstate.optimizer_state, eta=new_lr)
-                if !(session.model isa ObservationEncoderDecoder)
-                    _adjust_latent_lr!(session.tstate.optimizer_state, new_lr * cfg.latent_lr_multiplier)
-                end
+                _adjust_latent_lr!(session.tstate.optimizer_state, new_lr * cfg.latent_lr_multiplier)
                 current_lr = new_lr
             else
                 current_lr = cfg.lr
             end
-            if session.model isa ObservationEncoderDecoder
-                println("epoch $epoch  loss = $avg_loss  lr = $current_lr")
+            latent_lr = current_lr * cfg.latent_lr_multiplier
+            if sinkhorn_residuals[1] !== nothing
+                avg_res = sum(Float32(r) for r in sinkhorn_residuals) / mode.n_full
+                println("epoch $epoch  loss = $avg_loss  sinkhorn_residual = $avg_res  lr = $current_lr  latent_lr = $latent_lr")
             else
-                latent_lr = current_lr * cfg.latent_lr_multiplier
                 println("epoch $epoch  loss = $avg_loss  lr = $current_lr  latent_lr = $latent_lr")
             end
         else

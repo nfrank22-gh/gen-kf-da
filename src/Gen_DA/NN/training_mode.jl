@@ -32,7 +32,9 @@ end
 
 function VorticityMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int;
                        freeze_upsampler::Bool=false,
-                       recon_loss::Symbol=:swd)
+                       recon_loss::Symbol=:swd,
+                       sinkhorn_eps::Float32=0.1f0,
+                       sinkhorn_n_iter::Int=100)
     n_full = size(train_snaps, 3) ÷ batch_size
     prepare_epoch_fn = function(full_batches)
         omega_cpu = zeros(Float32, N, N, batch_size * n_full)
@@ -48,25 +50,26 @@ function VorticityMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int;
     end
     train_loss_fn = function(m, params, states, data)
         omega_trg, thetas, cols, eps, kl_w = data
-        l, new_st = loss_fn_vort_state(m, N, params, states, omega_trg, thetas, cols,
-                                        eps, sum(kl_w);
-                                        recon_loss=recon_loss)
-        l, new_st, (;)
+        loss_fn_vort_state(m, N, params, states, omega_trg, thetas, cols,
+                           eps, sum(kl_w);
+                           recon_loss=recon_loss,
+                           sinkhorn_eps=sinkhorn_eps,
+                           sinkhorn_n_iter=sinkhorn_n_iter)
     end
-    VorticityMode(batch_size, n_full, N * N, freeze_upsampler,
+    thetas_flat_dim = recon_loss == :sinkhorn ? 1 : N * N
+    VorticityMode(batch_size, n_full, thetas_flat_dim, freeze_upsampler,
                   prepare_epoch_fn, get_data_batch_fn, train_loss_fn)
 end
 
 # Shared factory for the two observation modes that use a single fixed sensor_lin vector.
 # extractor_fn: (snaps, batch_indices, grid) -> (u_cpu, v_cpu) for n_meas rows.
-# use_encoder: when true, assembles (6, n_meas, B) obs_features and calls loss_fn_encoder.
 function _make_shared_sensor_mode(
     train_snaps::Array{Float32,3}, N::Int, batch_size::Int,
     n_meas::Int, sensor_lin,
     extractor_fn,
     freeze_upsampler::Bool, recon_loss::Symbol,
-    thetas_flat_dim::Int;
-    use_encoder::Bool=false,
+    thetas_flat_dim::Int,
+    sinkhorn_eps::Float32, sinkhorn_n_iter::Int,
 )
     n_full    = size(train_snaps, 3) ÷ batch_size
     data_grid = SpectralGrid(N)
@@ -80,37 +83,17 @@ function _make_shared_sensor_mode(
         return u_cpu, v_cpu
     end
 
-    if use_encoder
-        sensor_fourier = _sensor_fourier_features(sensor_lin, N)   # (4, n_meas), precomputed
-
-        get_data_batch_fn = function(data_all, cols)
-            u_all, v_all = data_all
-            u_b = u_all[:, cols]   # (n_meas, B)
-            v_b = v_all[:, cols]
-            B   = length(cols)
-            sf  = repeat(reshape(sensor_fourier, 4, n_meas, 1), 1, 1, B)   # (4, n_meas, B)
-            obs = cat(reshape(u_b, 1, n_meas, B),
-                      reshape(v_b, 1, n_meas, B),
-                      sf; dims=1)   # (6, n_meas, B)
-            return (Reactant.to_rarray(obs),)
-        end
-        train_loss_fn = function(m, params, states, data)
-            obs_features, thetas, cols, eps, kl_w = data
-            l, new_st = loss_fn_encoder(m, N, params, states, obs_features, sensor_lin,
-                                        thetas, eps, sum(kl_w); recon_loss=recon_loss)
-            l, new_st, (;)
-        end
-    else
-        get_data_batch_fn = function(data_all, cols)
-            u_all, v_all = data_all
-            return (Reactant.to_rarray(u_all[:, cols]), Reactant.to_rarray(v_all[:, cols]))
-        end
-        train_loss_fn = function(m, params, states, data)
-            u_trg, v_trg, thetas, cols, eps, kl_w = data
-            l, new_st = loss_fn(m, N, params, states, u_trg, v_trg, sensor_lin, thetas, cols,
-                                eps, sum(kl_w); recon_loss=recon_loss)
-            l, new_st, (;)
-        end
+    get_data_batch_fn = function(data_all, cols)
+        u_all, v_all = data_all
+        return (Reactant.to_rarray(u_all[:, cols]), Reactant.to_rarray(v_all[:, cols]))
+    end
+    train_loss_fn = function(m, params, states, data)
+        u_trg, v_trg, thetas, cols, eps, kl_w = data
+        loss_fn(m, N, params, states, u_trg, v_trg, sensor_lin, thetas, cols,
+                eps, sum(kl_w);
+                recon_loss=recon_loss,
+                sinkhorn_eps=sinkhorn_eps,
+                sinkhorn_n_iter=sinkhorn_n_iter)
     end
 
     return ObservationsMode(batch_size, n_full, thetas_flat_dim, freeze_upsampler,
@@ -122,14 +105,16 @@ function ObservationsMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int
                           freeze_upsampler::Bool=false,
                           random_sensors::Bool=false, rng=nothing,
                           recon_loss::Symbol=:swd,
-                          use_encoder::Bool=false)
+                          sinkhorn_eps::Float32=0.1f0,
+                          sinkhorn_n_iter::Int=100)
     if isinf(n_meas_space)
-        use_encoder && error("use_encoder=true is not supported for full-velocity (isinf(n_meas_space)) mode")
-        extractor = (snaps, idxs, grid) -> DataPipeline.extract_full_velocity(snaps, idxs, grid)
+        extractor  = (snaps, idxs, grid) -> DataPipeline.extract_full_velocity(snaps, idxs, grid)
         sensor_lin = LinearIndices((N, N))[:]
+        td = recon_loss == :sinkhorn ? 1 : 2 * N * N
         return _make_shared_sensor_mode(train_snaps, N, batch_size, N * N, sensor_lin,
                                         extractor, freeze_upsampler,
-                                        recon_loss, 2 * N * N)
+                                        recon_loss, td,
+                                        sinkhorn_eps, sinkhorn_n_iter)
     end
 
     if random_sensors
@@ -149,51 +134,32 @@ function ObservationsMode(train_snaps::Array{Float32,3}, N::Int, batch_size::Int
             return u_cpu, v_cpu
         end
 
-        if use_encoder
-            get_data_batch_fn = function(data_all, cols)
-                u_all, v_all = data_all
-                u_b  = u_all[:, cols]                   # (n_meas, B)
-                v_b  = v_all[:, cols]
-                s_b  = sensor_lin_all[:, cols]          # (n_meas, B) Int32
-                B    = length(cols)
-                sf   = _sensor_fourier_features_per_sample(s_b, N)   # (4, n_meas, B)
-                obs  = cat(reshape(u_b, 1, n_meas_space, B),
-                           reshape(v_b, 1, n_meas_space, B),
-                           sf; dims=1)                  # (6, n_meas, B)
-                return (Reactant.to_rarray(obs),
-                        Reactant.to_rarray(s_b))
-            end
-            train_loss_fn = function(m, params, states, data)
-                obs_features, sensor_lin_batch, thetas, cols, eps, kl_w = data
-                l, new_st = loss_fn_encoder_per_sample(
-                    m, N, params, states, obs_features, sensor_lin_batch,
-                    thetas, eps, sum(kl_w); recon_loss=recon_loss)
-                l, new_st, (;)
-            end
-        else
-            get_data_batch_fn = function(data_all, cols)
-                u_all, v_all = data_all
-                return (Reactant.to_rarray(u_all[:, cols]),
-                        Reactant.to_rarray(v_all[:, cols]),
-                        Reactant.to_rarray(sensor_lin_all[:, cols]))
-            end
-            train_loss_fn = function(m, params, states, data)
-                u_trg, v_trg, sensor_lin_batch, thetas, cols, eps, kl_w = data
-                l, new_st = loss_fn_per_sample_sensors(
-                    m, N, params, states, u_trg, v_trg, sensor_lin_batch, thetas, cols,
-                    eps, sum(kl_w); recon_loss=recon_loss)
-                l, new_st, (;)
-            end
+        get_data_batch_fn = function(data_all, cols)
+            u_all, v_all = data_all
+            return (Reactant.to_rarray(u_all[:, cols]),
+                    Reactant.to_rarray(v_all[:, cols]),
+                    Reactant.to_rarray(sensor_lin_all[:, cols]))
+        end
+        train_loss_fn = function(m, params, states, data)
+            u_trg, v_trg, sensor_lin_batch, thetas, cols, eps, kl_w = data
+            loss_fn_per_sample_sensors(
+                m, N, params, states, u_trg, v_trg, sensor_lin_batch, thetas, cols,
+                eps, sum(kl_w);
+                recon_loss=recon_loss,
+                sinkhorn_eps=sinkhorn_eps,
+                sinkhorn_n_iter=sinkhorn_n_iter)
         end
 
-        return ObservationsMode(batch_size, n_full, 2 * n_meas_space, freeze_upsampler,
+        td = recon_loss == :sinkhorn ? 1 : 2 * n_meas_space
+        return ObservationsMode(batch_size, n_full, td, freeze_upsampler,
                                 prepare_epoch_fn, get_data_batch_fn, train_loss_fn)
     end
 
     extractor  = (snaps, idxs, grid) -> DataPipeline.extract_observations(snaps, idxs, sensor_ci, grid)
     sensor_lin = LinearIndices((N, N))[sensor_ci]
+    td = recon_loss == :sinkhorn ? 1 : 2 * n_meas_space
     return _make_shared_sensor_mode(train_snaps, N, batch_size, n_meas_space, sensor_lin,
                                     extractor, freeze_upsampler,
-                                    recon_loss, 2 * n_meas_space;
-                                    use_encoder=use_encoder)
+                                    recon_loss, td,
+                                    sinkhorn_eps, sinkhorn_n_iter)
 end

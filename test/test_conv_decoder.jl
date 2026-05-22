@@ -18,24 +18,24 @@ using Test, Gen_DA.NN, Random, Lux
         3,         # tail_kernel
         gelu,
         N,         # N_conv == N: no spectral upsample at end
-        N, rng, T)
+        N, rng, T;
+        spectral_modes=[4, 4], tail_spectral_modes=4)
 
     @test model.N_conv == N
     @test model.k_base == 4
     @test model.n_blocks == 2
 
-    x      = randn(rng, T, 16, batch)
-    shifts = zeros(T, 2, batch)
+    x = randn(rng, T, 16, batch)
 
-    u, v, _ = model(x, shifts, ps, st)
+    u, v, _ = model(x, ps, st)
     @test size(u) == (N, N, batch)
     @test size(v) == (N, N, batch)
 
-    u2, v2, _ = eval_decoder_vel(model, N, x, shifts, ps, st)
+    u2, v2, _ = eval_decoder_vel(model, N, x, ps, st)
     @test size(u2) == (N, N, batch)
     @test size(v2) == (N, N, batch)
 
-    omega, _ = eval_decoder_vort(model, N, x, shifts, ps, st)
+    omega, _ = eval_decoder_vort(model, N, x, ps, st)
     @test size(omega) == (N, N, batch)
 end
 
@@ -58,17 +58,17 @@ end
         3,        # tail_kernel
         gelu,
         16,       # N_conv=16; N ÷ N_conv = 2 ✓
-        N, rng, T)
+        N, rng, T;
+        spectral_modes=[4], tail_spectral_modes=4)
 
     @test model.N_conv == 16
 
-    x      = randn(rng, T, 8, batch)
-    shifts = zeros(T, 2, batch)
-    u, v, _ = model(x, shifts, ps, st)
+    x = randn(rng, T, 8, batch)
+    u, v, _ = model(x, ps, st)
     @test size(u) == (N, N, batch)
     @test size(v) == (N, N, batch)
 
-    omega, _ = eval_decoder_vort(model, N, x, shifts, ps, st)
+    omega, _ = eval_decoder_vort(model, N, x, ps, st)
     @test size(omega) == (N, N, batch)
 end
 
@@ -91,11 +91,11 @@ end
         3,      # tail_kernel
         gelu,
         N,      # N_conv == N
-        N, rng, T)
+        N, rng, T;
+        spectral_modes=[4], tail_spectral_modes=4)
 
-    x      = randn(rng, T, 4, batch)
-    shifts = zeros(T, 2, batch)
-    u, v, _ = model(x, shifts, ps, st)
+    x = randn(rng, T, 4, batch)
+    u, v, _ = model(x, ps, st)
     @test size(u) == (N, N, batch)
     @test size(v) == (N, N, batch)
 end
@@ -108,11 +108,28 @@ end
     batch = 2
 
     model, ps, st = ConvDecoder(
-        8, Int[], 4, 4, [8, 4], 2, [5, 3], 5, gelu, N, N, rng, T)
+        8, Int[], 4, 4, [8, 4], 2, [5, 3], 5, gelu, N, N, rng, T;
+        spectral_modes=[4, 4], tail_spectral_modes=4)
 
-    x      = randn(rng, T, 8, batch)
-    shifts = zeros(T, 2, batch)
-    u, v, _ = model(x, shifts, ps, st)
+    x = randn(rng, T, 8, batch)
+    u, v, _ = model(x, ps, st)
     @test size(u) == (N, N, batch)
     @test size(v) == (N, N, batch)
+end
+
+# SpectralCircConv parameter structure
+@testset "SpectralCircConv has W_lo/W_hi re+im params" begin
+    rng = Xoshiro(5)
+    T   = Float32
+    N   = 16
+    model, ps, st = ConvDecoder(
+        4, Int[], 4, 4, [4], 1, [3], 3, gelu, N, N, rng, T;
+        spectral_modes=[4], tail_spectral_modes=4)
+    # tail_conv1 is SpectralCircConv; its ps should have W_lo_re etc.
+    tc1_ps = ps.tail_conv1
+    @test haskey(tc1_ps, :W_lo_re)
+    @test haskey(tc1_ps, :W_lo_im)
+    @test haskey(tc1_ps, :W_hi_re)
+    @test haskey(tc1_ps, :W_hi_im)
+    @test size(tc1_ps.W_lo_re) == (4, 4, 1, 4)   # (k_max, k_max, C_out, C_in)
 end
