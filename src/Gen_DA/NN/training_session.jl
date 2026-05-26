@@ -2,6 +2,7 @@ import Reactant
 import Lux
 import Lux.Training as Training
 import Optimisers
+using Printf
 
 # Immutable hyperparameters — fixed for the lifetime of a training run.
 struct TrainingConfig
@@ -10,6 +11,7 @@ struct TrainingConfig
     lr::Float32
     latent_dim::Int
     kl_weight::Float32
+    h2_weight::Float32
     latent_lr_multiplier::Float32
 end
 
@@ -52,6 +54,7 @@ function TrainingSession(
     cosine_T_mult::Int               = 1,
     fix_thetas::Bool                 = true,
     kl_weight::Float32               = 0f0,
+    h2_weight::Float32               = 0f0,
     latent_lr_multiplier::Float32    = 10f0,
     init_latent_mu::Union{Nothing,Matrix{Float32},Float32}        = nothing,
     init_latent_log_sigma::Union{Nothing,Matrix{Float32},Float32} = nothing,
@@ -91,7 +94,7 @@ function TrainingSession(
     eval_omega = eval_snaps[:, :, 1:n_eval]
 
     cfg = TrainingConfig(n_epochs, eval_every, lr, latent_dim,
-                         kl_weight, latent_lr_multiplier)
+                         kl_weight, h2_weight, latent_lr_multiplier)
 
     return TrainingSession(
         model, mode, cfg, tstate, train_snaps, n_train, lr_sched, rng,
@@ -122,8 +125,9 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
             data_all = mode.prepare_epoch(full_batches)
             sample_epoch!(session.sampler)
 
-            batch_losses     = Vector{Any}(undef, mode.n_full)
+            batch_losses       = Vector{Any}(undef, mode.n_full)
             sinkhorn_residuals = Vector{Any}(undef, mode.n_full)
+            h2_regs            = Vector{Any}(undef, mode.n_full)
             for i in 1:mode.n_full
                 thetas_batch, cols = get_batch(session.sampler, i)
                 thetas     = Reactant.to_rarray(thetas_batch)
@@ -133,8 +137,9 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
                 _, loss, aux, session.tstate = Training.single_train_step!(
                     Lux.AutoEnzyme(), mode.train_loss,
                     (data_batch..., thetas, cols_ra, eps_ra, kl_w_ra), session.tstate)
-                batch_losses[i]      = loss
+                batch_losses[i]       = loss
                 sinkhorn_residuals[i] = get(aux, :sinkhorn_residual, nothing)
+                h2_regs[i]            = get(aux, :h2_reg, nothing)
             end
 
             avg_loss = sum(Float32(l) for l in batch_losses) / mode.n_full
@@ -148,13 +153,16 @@ function _train!(session::TrainingSession, mode::Union{VorticityMode, Observatio
             else
                 current_lr = cfg.lr
             end
-            latent_lr = current_lr * cfg.latent_lr_multiplier
+            msg = @sprintf("epoch %d  loss = %.4e  lr = %.2e", epoch, avg_loss, current_lr)
             if sinkhorn_residuals[1] !== nothing
                 avg_res = sum(Float32(r) for r in sinkhorn_residuals) / mode.n_full
-                println("epoch $epoch  loss = $avg_loss  sinkhorn_residual = $avg_res  lr = $current_lr  latent_lr = $latent_lr")
-            else
-                println("epoch $epoch  loss = $avg_loss  lr = $current_lr  latent_lr = $latent_lr")
+                msg *= @sprintf("  sinkhorn_res = %.2e", avg_res)
             end
+            if cfg.h2_weight > 0f0 && h2_regs[1] !== nothing
+                avg_h2 = sum(Float32(r) for r in h2_regs) / mode.n_full
+                msg *= @sprintf("  h2_reg = %.2e", avg_h2)
+            end
+            println(msg)
         else
             println("epoch $epoch  (upsampler frozen — skipping gradient update)")
         end
@@ -170,15 +178,16 @@ function _run_eval!(session::TrainingSession, epoch::Int, T)
     N_out  = size(session.eval_omega, 1)
     n_eval = size(session.eval_omega, 3)
     x_eval = Reactant.to_rarray(randn(session.rng, T, session.config.latent_dim, n_eval))
+    st_eval = Lux.testmode(session.tstate.states)
     if session.compiled_eval === nothing
         session.compiled_eval = Reactant.@compile eval_decoder_vort(
             session.model, N_out, x_eval,
-            session.tstate.parameters, session.tstate.states)
+            session.tstate.parameters, st_eval)
         println("Compiled eval forward pass.")
     end
     gen_omega_ra, _ = session.compiled_eval(
         session.model, N_out, x_eval,
-        session.tstate.parameters, session.tstate.states)
+        session.tstate.parameters, st_eval)
     gen_omega   = Array(gen_omega_ra)
     flat_dim    = N_out * N_out
     gen_flat    = reshape(gen_omega,          flat_dim, n_eval)
@@ -187,5 +196,5 @@ function _run_eval!(session::TrainingSession, epoch::Int, T)
     swd = sliced_wasserstein(gen_flat, eval_flat, thetas_eval)
     push!(session.eval_swds, swd)
     push!(session.eval_epochs, epoch)
-    println("  eval SWD = $swd")
+    println(@sprintf("  eval SWD = %.2e", swd))
 end

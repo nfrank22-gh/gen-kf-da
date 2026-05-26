@@ -62,7 +62,7 @@ function main()
     dt         = Float32(0.01)
     T_spinup   = 50
     T_data     = 10000
-    save_every = 1000
+    save_every = 100
     npart      = 40
     run_with_particles    = false
     run_without_particles = true

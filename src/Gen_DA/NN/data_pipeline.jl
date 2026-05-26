@@ -3,12 +3,14 @@ module DataPipeline
 using FFTW
 using JLD2
 using Random
+using Statistics
 import ..SpectralGrid, ..velocity_from_psi_hat
 
 export load_trajectory, split_trajectory, make_sensor_array, make_per_sample_sensors,
        batch_partition, extract_observations, extract_observations_per_sample,
        extract_full_velocity, extract_vorticity_spectral,
-       reduce_symmetries, reduce_trajectory
+       reduce_symmetries, reduce_trajectory,
+       standardize_snapshots, apply_standardization
 
 function load_trajectory(path::String)
     f = jldopen(path)
@@ -180,6 +182,23 @@ function reduce_trajectory(snaps::Array{Float32,3}, n::Int)
         out[:, :, t] = reduce_symmetries(@view(snaps[:, :, t]), n)
     end
     return out
+end
+
+# Per-pixel z-scoring computed from snaps (training data only).
+# Returns (standardized_snaps, mean_field, std_field).
+# std_field is clamped to 1f-8 to avoid division by zero at near-constant pixels.
+function standardize_snapshots(snaps::Array{Float32,3})
+    mean_field = dropdims(mean(snaps; dims=3); dims=3)
+    std_field  = dropdims(std(snaps;  dims=3); dims=3)
+    std_field  = max.(std_field, 1f-8)
+    return (snaps .- mean_field) ./ std_field, mean_field, std_field
+end
+
+# Apply pre-computed standardization statistics (from training data) to snaps.
+function apply_standardization(snaps::Array{Float32,3},
+                                mean_field::Matrix{Float32},
+                                std_field::Matrix{Float32})
+    return (snaps .- mean_field) ./ std_field
 end
 
 end # module DataPipeline

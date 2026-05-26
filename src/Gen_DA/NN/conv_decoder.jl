@@ -15,8 +15,8 @@ struct CircConv{C} <: Lux.AbstractLuxContainerLayer{(:conv,)}
     pad::Int
 end
 
-function CircConv(in_ch::Int, out_ch::Int, k::Int; bias::Bool=true, init_weight=kaiming_normal)
-    CircConv(Conv((k, k), in_ch => out_ch; pad=0, use_bias=bias, init_weight=init_weight), k ÷ 2)
+function CircConv(in_ch::Int, out_ch::Int, k::Int; bias::Bool=true, init_weight=kaiming_normal, groups::Int=1)
+    CircConv(Conv((k, k), in_ch => out_ch; pad=0, use_bias=bias, init_weight=init_weight, groups=groups), k ÷ 2)
 end
 
 function (l::CircConv)(x, ps, st)
@@ -45,22 +45,25 @@ struct SpectralCircConv{C} <: Lux.AbstractLuxLayer
     k_max::Int
     in_ch::Int
     out_ch::Int
+    use_spectral::Bool
 end
 
 function SpectralCircConv(in_ch::Int, out_ch::Int, k::Int, k_max::Int;
-                           bias::Bool=true, init_weight=kaiming_normal)
+                           bias::Bool=true, init_weight=kaiming_normal, use_spectral::Bool=true)
     SpectralCircConv(CircConv(in_ch, out_ch, k; bias=bias, init_weight=init_weight),
-                     k_max, in_ch, out_ch)
+                     k_max, in_ch, out_ch, use_spectral)
 end
 
 function Lux.initialparameters(rng::AbstractRNG, l::SpectralCircConv)
+    conv_ps = (conv = Lux.initialparameters(rng, l.conv),)
+    l.use_spectral || return conv_ps
     km    = l.k_max
     scale = Float32(1 / sqrt(l.in_ch * km * km))
-    (conv    = Lux.initialparameters(rng, l.conv),
-     W_lo_re = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
-     W_lo_im = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
-     W_hi_re = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
-     W_hi_im = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale)
+    merge(conv_ps, (
+        W_lo_re = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
+        W_lo_im = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
+        W_hi_re = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale,
+        W_hi_im = randn(rng, Float32, km, km, l.out_ch, l.in_ch) .* scale))
 end
 
 function Lux.initialstates(rng::AbstractRNG, l::SpectralCircConv)
@@ -75,6 +78,7 @@ function (l::SpectralCircConv)(x, ps, st)
 
     # ── Conv branch ───────────────────────────────────────────────────────────
     y_conv, new_conv_st = l.conv(x, ps.conv, st.conv)
+    l.use_spectral || return y_conv, (conv=new_conv_st,)
 
     # ── Spectral branch ───────────────────────────────────────────────────────
     x_hat    = rfft(reshape(x, H, W, C_in * B), 1:2)   # (H_half, W, C_in*B)
@@ -109,6 +113,21 @@ function (l::SpectralCircConv)(x, ps, st)
     y_spec = reshape(irfft(y_hat_f, H, 1:2), H, W, C_out, B)
 
     return y_conv .+ y_spec, (conv=new_conv_st,)
+end
+
+# ── Nearest-neighbor 2× upsampling ────────────────────────────────────────────
+# Each pixel becomes a 2×2 block. Implemented via cat + permutedims + reshape so
+# it composes with Reactant/XLA without requiring repeat(inner=...) support.
+
+function nearest_upsample_2x(x::AbstractArray{T,4}) where T
+    H, W, C, B = size(x)
+    CB = C * B
+    # Double along H: stack two copies of each row, interleave via permutedims
+    xh = reshape(permutedims(cat(reshape(x, H, 1, W, CB), reshape(x, H, 1, W, CB); dims=2),
+                              (2, 1, 3, 4)), 2H, W, C, B)
+    # Double along W: same pattern along the column dimension
+    reshape(permutedims(cat(reshape(xh, 2H, W, 1, CB), reshape(xh, 2H, W, 1, CB); dims=3),
+                         (1, 3, 2, 4)), 2H, 2W, C, B)
 end
 
 # ── Spectral 2× upsampling ─────────────────────────────────────────────────────
@@ -148,52 +167,158 @@ function spectral_upsample_to(x::AbstractArray{T,4}, N_out::Int) where T
     return h
 end
 
+# Spectral 2× downsampling (low-pass filter + decimation).
+# Inverse of spectral_upsample_2x: keeps the low-frequency half of the spectrum
+# and scales by 1/4 so that spectral_downsample_2x(spectral_upsample_2x(x)) == x
+# for any bandlimited x.
+function spectral_downsample_2x(x::AbstractArray{T,4}) where T
+    H2, W2, C, B = size(x)
+    H  = H2 ÷ 2
+    W  = W2 ÷ 2
+    hy = H ÷ 2
+    hx = W ÷ 2
+    x_flat  = reshape(x, H2, W2, C * B)
+    x_hat   = rfft(x_flat, 1:2)                               # (H+1, W2, C*B)
+    x_trunc = cat(x_hat[1:hy+1, 1:hx, :],
+                  x_hat[1:hy+1, W2-hx+1:W2, :]; dims=2)      # (H÷2+1, W, C*B)
+    x_down  = irfft(x_trunc, H, 1:2) .* T(1//4)              # (H, W, C*B)
+    return reshape(x_down, H, W, C, B)
+end
+
+# Anti-aliased activation: upsample 2× → apply elementwise act → downsample 2×.
+# The nonlinearity generates frequency content above the Nyquist of x; the
+# spectral downsample acts as an ideal low-pass filter to remove those aliased
+# components before returning to the original resolution.
+function antialias_act(act::F, x::AbstractArray{T,4}) where {F, T}
+    return spectral_downsample_2x(act.(spectral_upsample_2x(x)))
+end
+
+# Dispatch on use_antialias flag: anti-aliased or plain elementwise.
+_apply_act(act::F, x, ::Val{true})  where {F} = antialias_act(act, x)
+_apply_act(act::F, x, ::Val{false}) where {F} = act.(x)
+
+# ── Norm factory ───────────────────────────────────────────────────────────────
+_make_norm(norm_type::Symbol, C::Int) =
+    norm_type == :batch ? BatchNorm(C) : InstanceNorm(C)
+
 # ── MLP builder ────────────────────────────────────────────────────────────────
 
 function _build_mlp(in_dim::Int, hidden::Vector{Int}, out_dim::Int, act)
     dims = [in_dim; hidden]
     n_hidden = length(hidden)
     hidden_layers = ntuple(n_hidden) do i
-        Chain(Dense(dims[i] => dims[i+1], act; init_weight=kaiming_normal), LayerNorm((dims[i+1],)))
+        Chain(Dense(dims[i] => dims[i+1]; init_weight=kaiming_normal),
+              BatchNorm(dims[i+1]),
+              WrappedFunction(act))
     end
     return Chain(hidden_layers..., Dense(dims[end] => out_dim; init_weight=kaiming_normal))
 end
 
-# ── DenseNet Upsampling Block ──────────────────────────────────────────────────
-# spectral_upsample_2x → dense block: (n_convs-1) layers of CircConv(j·C_in → C_in)
-#   → InstanceNorm → act → cat, growing h from C_in to n_convs·C_in channels.
-# Then: CircConv(n_convs·C_in → n_convs·C_in) → InstanceNorm → act → 1×1 proj.
-# No additive skip; gradient flow is through the dense concatenation paths.
-# Edge case: n_convs=1 — zero dense layers; main_conv receives C_in channels.
+# ── Gather-Excite block (GE-θ+) ───────────────────────────────────────────────
+# Gather: depth-wise CircConv (one filter per channel) → spatial context map (H,W,C,B).
+# Excite: Conv1×1(C→C_r) → act → Conv1×1(C_r→C) → sigmoid.
+# Gate:   x * (1 + sigmoid(context)), scale ∈ [1,2] — amplification only.
+# No norms or activations are applied between GEBlock output and the caller's projection.
 
-struct UpsampleBlock{DC, DN, CV, IN, PJ, A} <:
-        Lux.AbstractLuxContainerLayer{(:dense_convs, :dense_norms, :main_conv, :main_norm, :proj)}
-    dense_convs::DC   # NamedTuple{(:conv_1,...)} SpectralCircConv(j·C_in → C_in) per plain layer
-    dense_norms::DN   # NamedTuple{(:norm_1,...)} InstanceNorm(C_in) per plain layer
-    main_conv::CV     # SpectralCircConv: n_convs·C_in → n_convs·C_in
-    main_norm::IN     # InstanceNorm(n_convs·C_in)
-    proj::PJ          # Conv 1×1: n_convs·C_in → C_out
+struct GEBlock{G, F1, F2, A} <: Lux.AbstractLuxContainerLayer{(:ge_gather, :ge_fc1, :ge_fc2)}
+    ge_gather::G   # depth-wise CircConv C → C
+    ge_fc1::F1     # Conv 1×1: C → C_r
+    ge_fc2::F2     # Conv 1×1: C_r → C
     act::A
-    n_dense::Int      # n_convs - 1
+    use_antialias::Bool
 end
 
-function UpsampleBlock(C_in::Int, C_out::Int, k::Int, k_max::Int, act, n_convs::Int)
+function GEBlock(C::Int, k::Int, r::Int, act; use_antialias::Bool=true)
+    C_r = max(C ÷ r, 4)
+    ge_gather = CircConv(C, C, k; groups=C)
+    ge_fc1    = Conv((1,1), C => C_r; init_weight=kaiming_normal)
+    ge_fc2    = Conv((1,1), C_r => C; init_weight=kaiming_normal)
+    GEBlock(ge_gather, ge_fc1, ge_fc2, act, use_antialias)
+end
+
+function (b::GEBlock)(x, ps, st)
+    aa = Val(b.use_antialias)
+    ctx, st_gg = b.ge_gather(x, ps.ge_gather, st.ge_gather)
+    ctx, st_f1 = b.ge_fc1(ctx, ps.ge_fc1, st.ge_fc1)
+    ctx = _apply_act(b.act, ctx, aa)
+    ctx, st_f2 = b.ge_fc2(ctx, ps.ge_fc2, st.ge_fc2)
+    return x .* (1 .+ _apply_act(sigmoid, ctx, aa)), (ge_gather=st_gg, ge_fc1=st_f1, ge_fc2=st_f2)
+end
+
+# ── DenseNet Upsampling Block ──────────────────────────────────────────────────
+# upsample_mode=:spectral  — spectral_upsample_2x (default, deterministic)
+# upsample_mode=:conv_transpose — ConvTranspose(stride=2) → InstanceNorm → act (learned)
+#
+# After upsampling: dense block: (n_convs-1) layers of SpectralCircConv(j·C_in → C_in)
+#   → BatchNorm → act → cat, growing h from C_in to n_convs·C_in channels.
+# Then: BatchNorm → act → optional GE attention → 1×1 proj (no norm or act after proj).
+# No additive skip; gradient flow is through the dense concatenation paths.
+# Edge case: n_convs=1 — zero dense layers; proj receives x_up (C_in channels) directly.
+
+struct UpsampleBlock{UC, UN, DC, DN, PN, GE, PJ, A} <:
+        Lux.AbstractLuxContainerLayer{(:upsample_conv, :upsample_norm, :dense_convs, :dense_norms, :proj_norm, :ge, :proj)}
+    upsample_conv::UC   # ConvTranspose(stride=2) or NoOpLayer
+    upsample_norm::UN   # BatchNorm(C_in) or NoOpLayer
+    dense_convs::DC     # NamedTuple{(:conv_1,...)} SpectralCircConv(j·C_in → C_in) per layer
+    dense_norms::DN     # NamedTuple{(:norm_1,...)} NoOpLayer for i=1, BatchNorm(i·C_in) for i≥2
+    proj_norm::PN       # BatchNorm(n_convs·C_in)
+    ge::GE              # GEBlock(n_convs·C_in) or NoOpLayer
+    proj::PJ            # Conv 1×1: n_convs·C_in → C_out
+    act::A
+    n_dense::Int        # n_convs - 1
+    upsample_mode::Symbol
+    use_antialias::Bool
+    norm_type::Symbol   # :batch or :instance
+end
+
+function UpsampleBlock(C_in::Int, C_out::Int, k::Int, k_max::Int, act, n_convs::Int;
+                        use_spectral::Bool=true,
+                        upsample_mode::Symbol=:spectral,
+                        upsample_kernel::Int=4,
+                        use_ge::Bool=false,
+                        ge_kernel::Int=7,
+                        ge_reduction::Int=4,
+                        use_antialias::Bool=true,
+                        norm_type::Symbol=:batch)
     n_dense     = n_convs - 1
     conv_keys   = ntuple(i -> Symbol(:conv_, i), n_dense)
-    conv_vals   = ntuple(i -> SpectralCircConv(i * C_in, C_in, k, k_max), n_dense)
+    conv_vals   = ntuple(i -> SpectralCircConv(i * C_in, C_in, k, k_max; use_spectral=use_spectral), n_dense)
     dense_convs = NamedTuple{conv_keys}(conv_vals)
     norm_keys   = ntuple(i -> Symbol(:norm_, i), n_dense)
-    norm_vals   = ntuple(_ -> InstanceNorm(C_in), n_dense)
+    norm_vals   = ntuple(i -> i == 1 ? NoOpLayer() : _make_norm(norm_type, i * C_in), n_dense)
     dense_norms = NamedTuple{norm_keys}(norm_vals)
-    C_main      = n_convs * C_in
-    main_conv   = SpectralCircConv(C_main, C_main, k, k_max)
-    main_norm   = InstanceNorm(C_main)
-    proj        = Conv((1, 1), C_main => C_out; init_weight=kaiming_normal)
-    return UpsampleBlock(dense_convs, dense_norms, main_conv, main_norm, proj, act, n_dense)
+    C_main       = n_convs * C_in
+    proj_norm    = _make_norm(norm_type, C_main)
+    ge           = use_ge ? GEBlock(C_main, ge_kernel, ge_reduction, act; use_antialias=use_antialias) : NoOpLayer()
+    proj         = Conv((1, 1), C_main => C_out; init_weight=kaiming_normal)
+    if upsample_mode == :conv_transpose
+        # pad = (k-2)÷2 gives output size exactly 2×input for any even upsample_kernel
+        pad = (upsample_kernel - 2) ÷ 2
+        upsample_conv = ConvTranspose((upsample_kernel, upsample_kernel), C_in => C_in;
+                                       stride=(2, 2), pad=pad, init_weight=kaiming_normal)
+        upsample_norm = _make_norm(norm_type, C_in)
+    else
+        upsample_conv = NoOpLayer()
+        upsample_norm = NoOpLayer()
+    end
+    return UpsampleBlock(upsample_conv, upsample_norm, dense_convs, dense_norms, proj_norm, ge, proj, act, n_dense, upsample_mode, use_antialias, norm_type)
 end
 
 function (block::UpsampleBlock)(x, ps, st)
-    x_up = spectral_upsample_2x(x)
+    aa = Val(block.use_antialias)
+    if block.upsample_mode == :conv_transpose
+        x_up, new_uc_st = block.upsample_conv(x, ps.upsample_conv, st.upsample_conv)
+        x_up, new_un_st = block.upsample_norm(x_up, ps.upsample_norm, st.upsample_norm)
+        x_up = _apply_act(block.act, x_up, aa)
+    elseif block.upsample_mode == :nearest
+        x_up = nearest_upsample_2x(x)
+        new_uc_st = st.upsample_conv
+        new_un_st = st.upsample_norm
+    else  # :spectral
+        x_up = spectral_upsample_2x(x)
+        new_uc_st = st.upsample_conv
+        new_un_st = st.upsample_norm
+    end
 
     h = x_up
     dense_conv_sts = st.dense_convs
@@ -201,21 +326,25 @@ function (block::UpsampleBlock)(x, ps, st)
     for i in 1:block.n_dense
         ck = Symbol(:conv_, i)
         nk = Symbol(:norm_, i)
-        c, new_st_c = getfield(block.dense_convs, ck)(h, getfield(ps.dense_convs, ck), getfield(dense_conv_sts, ck))
-        c, new_st_n = getfield(block.dense_norms, nk)(c, getfield(ps.dense_norms, nk), getfield(dense_norm_sts, nk))
-        c = block.act.(c)
+        if i == 1
+            h_in = h
+        else
+            h_normed, new_st_n = getfield(block.dense_norms, nk)(h, getfield(ps.dense_norms, nk), getfield(dense_norm_sts, nk))
+            dense_norm_sts = merge(dense_norm_sts, NamedTuple{(nk,)}((new_st_n,)))
+            h_in = _apply_act(block.act, h_normed, aa)
+        end
+        c, new_st_c = getfield(block.dense_convs, ck)(h_in, getfield(ps.dense_convs, ck), getfield(dense_conv_sts, ck))
         h = cat(h, c; dims=3)
         dense_conv_sts = merge(dense_conv_sts, NamedTuple{(ck,)}((new_st_c,)))
-        dense_norm_sts = merge(dense_norm_sts, NamedTuple{(nk,)}((new_st_n,)))
     end
 
-    h_cv, st_cv = block.main_conv(h, ps.main_conv, st.main_conv)
-    h_in, st_in = block.main_norm(h_cv, ps.main_norm, st.main_norm)
-    h = block.act.(h_in)
-
-    x_out, st_pj = block.proj(h, ps.proj, st.proj)
-    return x_out, (dense_convs=dense_conv_sts, dense_norms=dense_norm_sts,
-                   main_conv=st_cv, main_norm=st_in, proj=st_pj)
+    h_normed, st_pn = block.proj_norm(h, ps.proj_norm, st.proj_norm)
+    h_act = _apply_act(block.act, h_normed, aa)
+    h_att, new_ge_st = block.ge(h_act, ps.ge, st.ge)
+    x_out, st_pj   = block.proj(h_att, ps.proj, st.proj)
+    return x_out, (upsample_conv=new_uc_st, upsample_norm=new_un_st,
+                   dense_convs=dense_conv_sts, dense_norms=dense_norm_sts,
+                   proj_norm=st_pn, ge=new_ge_st, proj=st_pj)
 end
 
 # ── ConvDecoder ────────────────────────────────────────────────────────────────
@@ -232,6 +361,14 @@ struct ConvDecoder{FC, BLK, TC1, TC2, A} <:
     N_conv::Int     # conv backbone output resolution; spectrally upsampled to N after
     C::Int          # initial channel count (Fourier base output)
     n_blocks::Int
+    use_spectral::Bool
+    upsample_mode::Symbol   # :spectral or :conv_transpose
+    upsample_kernel::Int    # kernel size for ConvTranspose upsample (ignored when :spectral)
+    use_ge::Bool
+    ge_kernel_sizes::Vector{Int}
+    ge_reduction::Int
+    use_antialias::Bool
+    norm_type::Symbol   # :batch or :instance
 end
 
 function ConvDecoder(
@@ -249,11 +386,20 @@ function ConvDecoder(
         rng,
         T::Type{<:AbstractFloat}=Float32;
         spectral_modes::Vector{Int}  = fill(4, length(conv_channels)),
-        tail_spectral_modes::Int     = 4)
+        tail_spectral_modes::Int     = 4,
+        use_spectral::Bool           = true,
+        upsample_mode::Symbol        = :spectral,
+        upsample_kernel::Int         = 4,
+        use_ge::Bool                 = false,
+        ge_kernel_sizes::Vector{Int} = fill(7, length(conv_channels)),
+        ge_reduction::Int            = 4,
+        use_antialias::Bool          = true,
+        norm_type::Symbol            = :batch)
 
     n_blocks = length(conv_channels)
     @assert length(kernel_sizes) == n_blocks "kernel_sizes must have one entry per block, got $(length(kernel_sizes)) for $n_blocks blocks"
     @assert length(spectral_modes) == n_blocks "spectral_modes must have one entry per block, got $(length(spectral_modes)) for $n_blocks blocks"
+    @assert length(ge_kernel_sizes) == n_blocks "ge_kernel_sizes must have one entry per block, got $(length(ge_kernel_sizes)) for $n_blocks blocks"
     @assert 2 * k_base * (2^n_blocks) == N_conv "2·k_base·2^n_blocks must equal N_conv, got k_base=$k_base, n_blocks=$n_blocks, N_conv=$N_conv"
     @assert ispow2(N ÷ N_conv) "N ÷ N_conv must be a power of 2, got N=$N, N_conv=$N_conv"
     for i in 1:n_blocks
@@ -270,21 +416,27 @@ function ConvDecoder(
     ch         = [C; conv_channels]
     block_keys = ntuple(i -> Symbol(:block_, i), n_blocks)
     block_vals = ntuple(n_blocks) do i
-        UpsampleBlock(ch[i], ch[i+1], kernel_sizes[i], spectral_modes[i], act, n_convs_per_block)
+        UpsampleBlock(ch[i], ch[i+1], kernel_sizes[i], spectral_modes[i], act, n_convs_per_block;
+                      use_spectral=use_spectral, upsample_mode=upsample_mode, upsample_kernel=upsample_kernel,
+                      use_ge=use_ge, ge_kernel=ge_kernel_sizes[i], ge_reduction=ge_reduction,
+                      use_antialias=use_antialias, norm_type=norm_type)
     end
     blocks = NamedTuple{block_keys}(block_vals)
 
-    tail_conv1 = SpectralCircConv(conv_channels[end], 1, tail_kernel, tail_spectral_modes)
-    tail_conv2 = SpectralCircConv(1, 1, tail_kernel, tail_spectral_modes; init_weight=glorot_uniform)
+    tail_conv1 = SpectralCircConv(conv_channels[end], 1, tail_kernel, tail_spectral_modes;
+                                  use_spectral=use_spectral)
+    tail_conv2 = SpectralCircConv(1, 1, tail_kernel, tail_spectral_modes;
+                                  init_weight=glorot_uniform, use_spectral=use_spectral)
 
     grid  = SpectralGrid(N)
     model = ConvDecoder(fc, blocks, tail_conv1, tail_conv2, act,
-                        grid, k_base, N_conv, C, n_blocks)
+                        grid, k_base, N_conv, C, n_blocks, use_spectral, upsample_mode, upsample_kernel,
+                        use_ge, ge_kernel_sizes, ge_reduction, use_antialias, norm_type)
     ps, st = Lux.setup(rng, model)
     return model, ps, st
 end
 
-function _eval_psi_physical(model::ConvDecoder, x, ps, st)
+function _eval_omega_physical(model::ConvDecoder, x, ps, st)
     B_batch = size(x, 2)
     Hy   = model.k_base + 1
     Wx   = 2 * model.k_base
@@ -309,23 +461,24 @@ function _eval_psi_physical(model::ConvDecoder, x, ps, st)
         block_sts = merge(block_sts, NamedTuple{(blk_key,)}((new_st_i,)))
     end
 
-    # Tail: conv_channels[end] → 1 → act → 1 (linear) → ψ at N_conv×N_conv
+    # Tail: conv_channels[end] → 1 → act → 1 (linear) → ω at N_conv×N_conv
     h1, st_tc1 = model.tail_conv1(h, ps.tail_conv1, st.tail_conv1)
-    h1 = model.act.(h1)
-    psi_4d, st_tc2 = model.tail_conv2(h1, ps.tail_conv2, st.tail_conv2)
+    h1 = _apply_act(model.act, h1, Val(model.use_antialias))
+    omega_4d, st_tc2 = model.tail_conv2(h1, ps.tail_conv2, st.tail_conv2)
 
-    # Spectral upsample ψ from N_conv to N when N_conv < N
+    # Spectral upsample ω from N_conv to N when N_conv < N
     if model.N_conv < model.grid.N
-        psi_4d = spectral_upsample_to(psi_4d, model.grid.N)
+        omega_4d = spectral_upsample_to(omega_4d, model.grid.N)
     end
-    psi = psi_4d[:, :, 1, :]   # (N, N, B_batch)
+    omega = omega_4d[:, :, 1, :]   # (N, N, B_batch)
 
-    return psi, (fc=st_fc, blocks=block_sts, tail_conv1=st_tc1, tail_conv2=st_tc2)
+    return omega, (fc=st_fc, blocks=block_sts, tail_conv1=st_tc1, tail_conv2=st_tc2)
 end
 
 function (model::ConvDecoder)(x, ps, st)
-    psi, new_st = _eval_psi_physical(model, x, ps, st)
-    psi_hat = rfft(psi, 1:2) .* model.grid.dc_mask
+    omega, new_st = _eval_omega_physical(model, x, ps, st)
+    omega_hat = rfft(omega, 1:2) .* model.grid.dc_mask
+    psi_hat   = .-omega_hat ./ model.grid.lap
     ikx = complex.(zero(model.grid.kx), model.grid.kx)
     iky = complex.(zero(model.grid.ky), model.grid.ky)
     u = irfft(iky .* psi_hat, model.grid.N, 1:2)
@@ -338,8 +491,24 @@ function eval_decoder_vel(model::ConvDecoder, ::Integer, x, ps, st)
 end
 
 function eval_decoder_vort(model::ConvDecoder, ::Integer, x, ps, st)
-    psi, new_st = _eval_psi_physical(model, x, ps, st)
-    psi_hat   = rfft(psi, 1:2) .* model.grid.dc_mask
-    omega_hat = .-model.grid.lap .* psi_hat
+    omega, new_st = _eval_omega_physical(model, x, ps, st)
+    omega_hat = rfft(omega, 1:2) .* model.grid.dc_mask
     return irfft(omega_hat, model.grid.N, 1:2), new_st
+end
+
+function eval_decoder_vort_and_hat(model::ConvDecoder, ::Integer, x, ps, st)
+    omega, new_st = _eval_omega_physical(model, x, ps, st)
+    omega_hat = rfft(omega, 1:2) .* model.grid.dc_mask
+    return irfft(omega_hat, model.grid.N, 1:2), omega_hat, new_st
+end
+
+function eval_decoder_vel_vort_hat(model::ConvDecoder, ::Integer, x, ps, st)
+    omega, new_st = _eval_omega_physical(model, x, ps, st)
+    omega_hat = rfft(omega, 1:2) .* model.grid.dc_mask
+    psi_hat   = .-omega_hat ./ model.grid.lap
+    ikx = complex.(zero(model.grid.kx), model.grid.kx)
+    iky = complex.(zero(model.grid.ky), model.grid.ky)
+    u         = irfft(iky .* psi_hat, model.grid.N, 1:2)
+    v         = irfft(.-ikx .* psi_hat, model.grid.N, 1:2)
+    return u, v, omega_hat, new_st
 end

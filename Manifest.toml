@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "b455e6aafb8567e159949ad835aa467ec1fae9d0"
+project_hash = "b31a4a93f9bfffe7cf2fe2c8cafe15f4cc14d195"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -705,7 +705,7 @@ uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
 version = "1.10.0"
 
 [[deps.Gen_DA]]
-deps = ["AbstractFFTs", "CairoMakie", "Enzyme", "FFTW", "JLD2", "JSON3", "Lux", "Optimisers", "Random", "Reactant", "Reactant_jll", "Revise", "Statistics", "Zygote"]
+deps = ["AbstractFFTs", "CairoMakie", "Enzyme", "FFTW", "JLD2", "JSON3", "Lux", "NNlib", "Optimisers", "Random", "Reactant", "Reactant_jll", "Revise", "Statistics", "Zygote"]
 path = "."
 uuid = "0f4bee7b-d0b6-4e0d-9a95-3866ac81e3fe"
 version = "0.1.0"

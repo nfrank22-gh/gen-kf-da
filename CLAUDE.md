@@ -86,10 +86,15 @@ test/
 | `k_base` | 4 | `:conv` arch: wavenumber cutoff; irfft output is `(2·k_base)×(2·k_base)`; must satisfy `2·k_base·2^n_blocks = N_conv` |
 | `init_channels` | 16 | `:conv` arch: initial channel count C (Fourier base output) |
 | `conv_channels` | [32,16,8] | `:conv` arch: output channel count per UpsampleBlock; `length` = n_blocks |
-| `n_convs_per_block` | 2 | `:conv` arch: DenseNet convolutions per UpsampleBlock (1 = no dense layers, just main conv) |
+| `n_convs_per_block` | 2 | `:conv` arch: DenseNet convolutions per UpsampleBlock (1 = no dense layers, proj directly from upsampled input) |
 | `kernel_sizes` | [3,3,3] | `:conv` arch: kernel size per block (length = n_blocks) |
 | `tail_kernel` | 3 | `:conv` arch: kernel size for both tail convolutions |
 | `fc_hidden` | [256] | `:conv` arch: hidden layers for FC latent → Fourier coefficients |
+| `use_ge` | false | `:conv` arch: enable GE-θ+ spatial channel attention in each UpsampleBlock (see ADR 0017) |
+| `ge_kernel_sizes` | [7,7,...] | `:conv` arch: depth-wise gather kernel size per UpsampleBlock (length = n_blocks); only used when `use_ge=true` |
+| `ge_reduction` | 4 | `:conv` arch: bottleneck reduction ratio for GE excite FC (`C → max(C÷r,4) → C`); only used when `use_ge=true` |
+| `use_antialias` | true | `:conv` arch: `true` → wrap every spatial activation with spectral upsample 2× → act → downsample 2× (anti-aliasing); `false` → plain elementwise activation |
+| `upsample_mode` | `:spectral` | `:conv` arch: upsampling method per UpsampleBlock: `:spectral` (zero-pad rfft), `:conv_transpose` (learned ConvTranspose stride-2), or `:nearest` (nearest-neighbor pixel replication, no norm/act) |
 | `n_slices` | 10000 | SWD projection directions per batch |
 | `lr` | 0.1 | Adam learning rate |
 | `lr_scheduler` | `:reduce_on_plateau` | LR scheduler: `:reduce_on_plateau`, `:cosine_annealing`, `:cosine_annealing_warm_restarts`, or `:none` |
